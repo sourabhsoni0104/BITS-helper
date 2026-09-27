@@ -1,0 +1,93 @@
+{
+  "dataset_version": "synthetic-demo-2026.1",
+  "synthetic": true,
+  "documents": [
+    {
+      "document_id": "SYNTHETIC-RULES",
+      "document_type": "synthetic_test_fixture",
+      "file_name": "demo_snapshot.json",
+      "status": "validated",
+      "scope": "Fictional data for software behavior testing only"
+    }
+  ],
+  "evidence": [
+    {"evidence_id": "EV-RULES", "document_id": "SYNTHETIC-RULES", "page": 1, "section": "Fictional requirements", "excerpt": "Synthetic programme requires one course in each demonstration category.", "verification_status": "verified"},
+    {"evidence_id": "EV-FOUND", "document_id": "SYNTHETIC-RULES", "page": 2, "section": "Fictional catalog", "excerpt": "SYN 100 is a fictional foundation course.", "verification_status": "verified"},
+    {"evidence_id": "EV-AI", "document_id": "SYNTHETIC-RULES", "page": 2, "section": "Fictional catalog", "excerpt": "SYN 210 covers artificial intelligence and requires SYN 100.", "verification_status": "verified"},
+    {"evidence_id": "EV-AI-HANDOUT", "document_id": "SYNTHETIC-RULES", "page": 3, "section": "Fictional handout", "excerpt": "SYN 210 has a project and explicitly has no midsemester exam.", "verification_status": "verified"},
+    {"evidence_id": "EV-LOCKED", "document_id": "SYNTHETIC-RULES", "page": 2, "section": "Fictional catalog", "excerpt": "SYN 310 requires fictional course SYN 200.", "verification_status": "verified"},
+    {"evidence_id": "EV-HUM", "document_id": "SYNTHETIC-RULES", "page": 4, "section": "Fictional handout", "excerpt": "HUM 150 uses a project; its exam details are intentionally absent.", "verification_status": "verified"},
+    {"evidence_id": "EV-OPEN", "document_id": "SYNTHETIC-RULES", "page": 5, "section": "Fictional handout", "excerpt": "OPEN 120 has no attendance requirement and includes a midsemester exam.", "verification_status": "verified"},
+    {"evidence_id": "EV-OFFERINGS", "document_id": "SYNTHETIC-RULES", "page": 6, "section": "Fictional timetable", "excerpt": "The listed demonstration courses are offered in SYN-2026-T1.", "verification_status": "verified"}
+  ],
+  "courses": [
+    {"course_id": "SYN-100", "code": "SYN 100", "title": "Synthetic Foundations", "units": 3, "topics": ["foundations"], "evidence_ids": ["EV-FOUND"]},
+    {"course_id": "SYN-210", "code": "SYN 210", "title": "Synthetic Intelligent Systems", "units": 3, "topics": ["artificial intelligence", "machine learning"], "evidence_ids": ["EV-AI"]},
+    {"course_id": "SYN-200", "code": "SYN 200", "title": "Synthetic Intermediate Methods", "units": 3, "topics": ["methods"], "evidence_ids": ["EV-LOCKED"]},
+    {"course_id": "SYN-310", "code": "SYN 310", "title": "Synthetic Advanced AI", "units": 3, "topics": ["artificial intelligence", "reasoning"], "evidence_ids": ["EV-LOCKED"]},
+    {"course_id": "HUM-150", "code": "HUM 150", "title": "Fictional Design and Society", "units": 3, "topics": ["design", "society"], "evidence_ids": ["EV-HUM"]},
+    {"course_id": "OPEN-120", "code": "OPEN 120", "title": "Fictional Open Studio", "units": 3, "topics": ["creative practice"], "evidence_ids": ["EV-OPEN"]}
+  ],
+  "offerings": [
+    {
+      "offering_id": "SYN-210-T1", "course_id": "SYN-210", "campus": "SYNTHETIC", "semester_id": "SYN-2026-T1",
+      "availability": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-OFFERINGS"]},
+      "categories": [{"category": "DEL", "programme_ids": ["BSC-SYNTH"], "verification_status": "verified", "evidence_ids": ["EV-RULES"]}],
+      "prerequisite": {"op": "completed", "course_id": "SYN-100"},
+      "handout_facts": {
+        "midsem_present": {"value": false, "verification_status": "verified", "evidence_ids": ["EV-AI-HANDOUT"]},
+        "project_present": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-AI-HANDOUT"]},
+        "attendance_required": {"value": null, "verification_status": "not_found", "evidence_ids": []}
+      },
+      "evidence_ids": ["EV-AI", "EV-OFFERINGS"]
+    },
+    {
+      "offering_id": "SYN-310-T1", "course_id": "SYN-310", "campus": "SYNTHETIC", "semester_id": "SYN-2026-T1",
+      "availability": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-OFFERINGS"]},
+      "categories": [{"category": "DEL", "programme_ids": ["BSC-SYNTH"], "verification_status": "verified", "evidence_ids": ["EV-RULES"]}],
+      "prerequisite": {"op": "completed", "course_id": "SYN-200"},
+      "handout_facts": {"midsem_present": {"value": false, "verification_status": "verified", "evidence_ids": ["EV-LOCKED"]}},
+      "evidence_ids": ["EV-LOCKED", "EV-OFFERINGS"]
+    },
+    {
+      "offering_id": "HUM-150-T1", "course_id": "HUM-150", "campus": "SYNTHETIC", "semester_id": "SYN-2026-T1",
+      "availability": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-OFFERINGS"]},
+      "categories": [{"category": "HUEL", "programme_ids": ["BSC-SYNTH"], "verification_status": "verified", "evidence_ids": ["EV-RULES"]}],
+      "prerequisite": {"op": "all_of", "conditions": []},
+      "handout_facts": {
+        "midsem_present": {"value": null, "verification_status": "not_found", "evidence_ids": []},
+        "project_present": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-HUM"]}
+      },
+      "evidence_ids": ["EV-HUM", "EV-OFFERINGS"]
+    },
+    {
+      "offering_id": "OPEN-120-T1", "course_id": "OPEN-120", "campus": "SYNTHETIC", "semester_id": "SYN-2026-T1",
+      "availability": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-OFFERINGS"]},
+      "categories": [{"category": "OPEL", "programme_ids": ["BSC-SYNTH"], "verification_status": "verified", "evidence_ids": ["EV-RULES"]}],
+      "prerequisite": {"op": "all_of", "conditions": []},
+      "handout_facts": {
+        "midsem_present": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-OPEN"]},
+        "attendance_required": {"value": false, "verification_status": "verified", "evidence_ids": ["EV-OPEN"]},
+        "project_present": {"value": true, "verification_status": "verified", "evidence_ids": ["EV-OPEN"]}
+      },
+      "evidence_ids": ["EV-OPEN", "EV-OFFERINGS"]
+    }
+  ],
+  "policy_contexts": [
+    {
+      "context_id": "SYNTHETIC-BSC-2024-2026",
+      "campus": "SYNTHETIC",
+      "admission_year_from": 2024,
+      "admission_year_to": 2026,
+      "programme_ids": ["BSC-SYNTH"],
+      "requirements": [
+        {"requirement_id": "SYN-CDC", "category": "CDC", "metric": "courses", "required_value": 1, "course_pool": ["SYN-100"], "mandatory_course_ids": ["SYN-100"], "evidence_ids": ["EV-RULES"]},
+        {"requirement_id": "SYN-DEL", "category": "DEL", "metric": "courses", "required_value": 1, "course_pool": ["SYN-210", "SYN-310"], "mandatory_course_ids": [], "evidence_ids": ["EV-RULES"]},
+        {"requirement_id": "SYN-HUEL", "category": "HUEL", "metric": "courses", "required_value": 1, "course_pool": ["HUM-150"], "mandatory_course_ids": [], "evidence_ids": ["EV-RULES"]},
+        {"requirement_id": "SYN-OPEL", "category": "OPEL", "metric": "courses", "required_value": 1, "course_pool": ["OPEN-120"], "mandatory_course_ids": [], "evidence_ids": ["EV-RULES"]}
+      ],
+      "evidence_ids": ["EV-RULES"]
+    }
+  ]
+}
+

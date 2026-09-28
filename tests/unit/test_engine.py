@@ -91,7 +91,7 @@ class EngineTests(unittest.TestCase):
         result = recommend(profile("SYN-100"), "I need a HUEL with no midsem.", self.snapshot)
         self.assertEqual(result["recommendations"], [])
         self.assertEqual(result["unverified_alternatives"][0]["course_code"], "HUM 150")
-        self.assertIn("could not be verified", result["no_result_reason"])
+        self.assertIn("do not confirm", result["no_result_reason"])
 
     def test_no_attendance_query_uses_verified_false(self) -> None:
         result = recommend(profile("SYN-100"), "I want an OPEL with no attendance requirement.", self.snapshot)

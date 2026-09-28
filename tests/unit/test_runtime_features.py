@@ -121,6 +121,25 @@ class AccountRepositoryTests(unittest.TestCase):
             self.assertIsNone(repo.get_session(token))
             repo.close()
 
+    def test_recommendation_history_persists_and_can_be_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "accounts.sqlite"
+            repo = AccountRepository(database)
+            user_id, _ = repo.register("person@example.edu", "password123")
+            repo.add_recommendation(user_id, {
+                "query": "AI courses",
+                "recommendations": [{"course_code": "CS F407", "title": "Artificial Intelligence", "reason": "AI"}],
+                "no_result_reason": "",
+            })
+            repo.close()
+            reopened = AccountRepository(database)
+            history = reopened.recommendation_history(user_id)
+            self.assertEqual(history[0]["query"], "AI courses")
+            self.assertEqual(history[0]["recommendations"][0]["course_code"], "CS F407")
+            reopened.clear_recommendation_history(user_id)
+            self.assertEqual(reopened.recommendation_history(user_id), [])
+            reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

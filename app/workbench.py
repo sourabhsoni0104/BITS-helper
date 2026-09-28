@@ -1,4 +1,4 @@
-"""Authenticated, local-first web workbench for profiles, sources, and reviews."""
+"""Authenticated local-first web workbench for profiles and academic data."""
 from __future__ import annotations
 
 import csv
@@ -19,17 +19,18 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from recommender.ingestion.corpus import CorpusError, get_document, get_document_page, library_stats
-from recommender.ingestion.review import build_review_bundle, publish_review, save_review
+from recommender.ingestion.corpus import CorpusError, get_document, get_document_page
 from recommender.ingestion.snapshots import SnapshotError, load_snapshot
 from recommender.models import AttemptStatus, CourseAttempt, StudentProfile
-from recommender.services.document_answers import answer_question
+from recommender.services.academic_agent import AcademicAgent
+from recommender.services.document_chat_agent import DocumentChatAgent
+from recommender.services.groq_client import GroqClient
 from recommender.services.marksheet_import import (
     MarksheetImportError,
     confirmed_attempts,
     preview_marksheet,
 )
-from recommender.services.recommendation import recommend
+from recommender.services.staged_discovery_agent import StagedDiscoveryAgent
 from recommender.storage.accounts import AccountError, AccountExistsError, AccountRepository
 from recommender.storage.profiles import (
     ProfileConflictError,
@@ -90,13 +91,6 @@ STATUS_LABELS = {
     "withdrawn": "Withdrawn",
     "unresolved": "Not sure yet",
 }
-DOCUMENT_TYPE_OPTIONS = (
-    ("handout", "Course handouts"),
-    ("regulations", "Academic regulations"),
-    ("bulletin", "Academic bulletin"),
-    ("timetable", "Timetable"),
-    ("reference", "Other reference documents"),
-)
 BRANCH_CODE_TO_PROGRAMME = {
     "A1": "BE-CHEMICAL",
     "A2": "BE-CIVIL",
@@ -139,16 +133,14 @@ def _esc(value: object) -> str:
 
 def _page(title: str, body: str, session: dict | None = None) -> bytes:
     if session:
-        links = '<a href="/">Profile</a><a href="/recommend">Recommendations</a><a href="/import">Upload transcript</a><a href="/documents">Documents</a>'
-        if session["role"] == "admin":
-            links += '<a href="/review">Source review</a>'
-        elif session.get("is_guest"):
+        links = '<a href="/">Profile</a><a href="/recommend">Recommendations</a><a href="/history">History</a><a href="/import">Upload transcript</a><a href="/documents">Chat</a>'
+        if session.get("is_guest"):
             links += '<a href="/login">Switch to saved account</a>'
         signout_label = "Forget this session" if session.get("is_guest") else "Sign out"
-        nav = f"""<nav><a href="/" style="font-size:1.15rem">Academic Workbench</a>{links}
+        nav = f"""<nav><a href="/" style="font-size:1.15rem">BITSbuddy</a>{links}
         <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><button class="secondary">{signout_label}</button></form></nav>"""
     else:
-        nav = '<nav><a href="/" style="font-size:1.15rem">Academic Workbench</a></nav>'
+        nav = '<nav><a href="/" style="font-size:1.15rem">BITSbuddy</a></nav>'
     text = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_esc(title)}</title><style>{CSS}</style></head><body><main class="shell">{nav}{body}</main></body></html>'
     return text.encode("utf-8")
 
@@ -364,7 +356,15 @@ def _attempt_editor(profile: StudentProfile | None, transcript_attempts: tuple[C
                     catalog: tuple[tuple[str, str, str], ...] = (), admission_year: int | None = None) -> str:
     attempts = list(profile.attempts if profile else ())
     existing_ids = {item.attempt_id for item in attempts if item.attempt_id}
-    attempts.extend(item for item in transcript_attempts if not item.attempt_id or item.attempt_id not in existing_ids)
+    existing_values = {
+        (item.course_id, item.status, item.grade, item.units_awarded, item.term_id, item.attempt_order)
+        for item in attempts
+    }
+    attempts.extend(
+        item for item in transcript_attempts
+        if (not item.attempt_id or item.attempt_id not in existing_ids)
+        and (item.course_id, item.status, item.grade, item.units_awarded, item.term_id, item.attempt_order) not in existing_values
+    )
     rows = [_attempt_row(str(index), attempt, catalog, admission_year) for index, attempt in enumerate(attempts)]
     if not rows:
         rows.append(_attempt_row("0", catalog=catalog, admission_year=admission_year))
@@ -429,109 +429,6 @@ def _parse_attempt_form(data: dict[str, list[str]], catalog: tuple[tuple[str, st
     return tuple(attempts)
 
 
-def _course_matches_from_staged(profile: StudentProfile, query: str, snapshot: dict,
-                                *, limit: int = 20) -> dict:
-    """Rank courses from supplied documents without claiming verified eligibility."""
-    stopwords = {
-        "a", "an", "and", "anything", "are", "cool", "course", "courses", "different",
-        "easy", "elective", "electives", "for", "from", "fun", "good", "i", "in",
-        "interesting", "is", "looking", "me", "my", "of", "or", "some", "something",
-        "suggest", "surprise", "that", "the", "to", "want", "with",
-    }
-    raw_terms = [term for term in re.findall(r"[a-z0-9]+", query.casefold()) if len(term) > 1 and term not in stopwords]
-    aliases = {
-        "ai": ("ai", "artificial intelligence", "machine learning", "neural"),
-        "ml": ("machine learning", "neural", "deep learning"),
-        "coding": ("programming", "software", "computing"),
-        "finance": ("finance", "financial", "investment", "markets"),
-    }
-    search_terms = tuple(dict.fromkeys(value for term in raw_terms for value in aliases.get(term, (term,))))
-    excluded = {attempt.course_id.casefold() for attempt in profile.attempts
-                if attempt.status in {AttemptStatus.COMPLETED, AttemptStatus.IN_PROGRESS}}
-    evidence = {item.get("evidence_id"): item for item in snapshot.get("evidence", []) if isinstance(item, dict)}
-    discovery_signals = (
-        (r"artificial intelligence|agentic ai|machine learning", "AI and machine learning"),
-        (r"human comp(?:uter)? interaction", "technology and human-centered design"),
-        (r"game theo", "strategic thinking through game theory"),
-        (r"cryptography", "security and cryptography"),
-        (r"robotics", "robotics and intelligent machines"),
-        (r"psychology", "human behavior and psychology"),
-        (r"creative writing", "creative writing"),
-        (r"public policy|political concepts", "public policy and society"),
-        (r"music", "music and culture"),
-        (r"entrep|new venture|innovation", "entrepreneurship and innovation"),
-        (r"bioethics", "technology, science, and ethics"),
-        (r"nano", "nanoscience and emerging technology"),
-        (r"climate|renewable|environment", "climate and sustainability"),
-        (r"quantum", "quantum science"),
-    )
-    programme_prefixes = {
-        "BE-CS": {"CS"}, "BE-EEE": {"EEE", "EE"}, "BE-ECE": {"ECE", "EEE"},
-        "BE-ENI": {"INSTR", "EEE"}, "BE-MECHANICAL": {"ME"}, "BE-CHEMICAL": {"CHE"},
-        "BE-CIVIL": {"CE"}, "MSC-ECONOMICS": {"ECON", "FIN"},
-        "MSC-BIO": {"BIO"}, "MSC-CHEMISTRY": {"CHEM"}, "MSC-MATHEMATICS": {"MATH"},
-        "MSC-PHYSICS": {"PHY"},
-    }
-    preferred_prefixes = set().union(*(programme_prefixes.get(item, set()) for item in profile.programme_ids))
-    ranked = []
-    for course in snapshot.get("courses", []):
-        if not isinstance(course, dict):
-            continue
-        course_id = str(course.get("course_id") or "")
-        code = str(course.get("code") or course_id)
-        title = str(course.get("title") or code)
-        if not course_id or course_id.casefold() in excluded or code.casefold() in excluded:
-            continue
-        refs = [str(item) for item in course.get("evidence_ids", []) if item]
-        source_text = " ".join(str(evidence.get(ref, {}).get("excerpt") or "") for ref in refs)
-        heading = f"{code} {title}".casefold()
-        haystack = f"{heading} {source_text.casefold()}"
-        prefix = code.split()[0].upper() if code.split() else ""
-        if search_terms:
-            matched = [term for term in raw_terms if any(alias in haystack for alias in aliases.get(term, (term,)))]
-            if not matched:
-                continue
-            score = sum(8 for term in search_terms if term in heading) + sum(1 for term in search_terms if term in haystack)
-            reason = ", ".join(dict.fromkeys(matched))
-            signal_index = len(discovery_signals)
-        else:
-            signal = next(((index, reason) for index, (pattern, reason) in enumerate(discovery_signals)
-                           if re.search(pattern, heading)), None)
-            if signal is None:
-                continue
-            signal_index, reason = signal
-            score = 100 - signal_index * 3 + (12 if prefix in preferred_prefixes else 0)
-        ranked.append((-score, signal_index, code, prefix, reason, {
-            "course_id": course_id,
-            "course_code": code,
-            "title": title,
-            "matched_topics": [f"Why it may fit: {reason}"],
-            "evidence_references": refs,
-            "badge": "Course match",
-            "source_note": "Matched from the supplied course documents. Check current offering and eligibility before registration.",
-        }))
-    ordered = sorted(ranked, key=lambda item: item[:3])
-    if search_terms:
-        recommendations = [item[5] for item in ordered[:limit]]
-    else:
-        recommendations = []
-        used_signals: set[int] = set()
-        prefix_counts: dict[str, int] = {}
-        for item in ordered:
-            _, signal_index, _, prefix, _, card = item
-            if signal_index in used_signals or prefix_counts.get(prefix, 0) >= 2:
-                continue
-            recommendations.append(card)
-            used_signals.add(signal_index)
-            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-            if len(recommendations) >= min(limit, 12):
-                break
-    return {
-        "recommendations": recommendations,
-        "no_result_reason": None if recommendations else "No course in the supplied documents matched that request. Try a subject name such as AI, finance, biology, or design.",
-    }
-
-
 def make_workbench_handler(
     *, snapshot_path: str | Path, corpus_path: str | Path, profile_db: str | Path,
     account_db: str | Path, review_path: str | Path, index_path: str | Path,
@@ -546,7 +443,15 @@ def make_workbench_handler(
     previews_lock = threading.RLock()
     guest_sessions: dict[str, dict] = {}
     guest_lock = threading.RLock()
+    chat_threads: dict[str, list[dict]] = {}
+    chat_lock = threading.RLock()
+    guest_recommendations: dict[str, list[dict]] = {}
+    recommendation_lock = threading.RLock()
     source_root = (corpus_path.parent.parent / "raw").resolve()
+    groq_client = GroqClient.from_environment()
+    academic_agent = AcademicAgent(groq_client, corpus_path) if groq_client is not None else None
+    staged_agent = StagedDiscoveryAgent(groq_client, corpus_path) if groq_client is not None else None
+    document_chat_agent = DocumentChatAgent(groq_client, corpus_path) if groq_client is not None else None
 
     def token_hash(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -560,6 +465,10 @@ def make_workbench_handler(
             guest_profiles.delete(session["profile_id"])
         with previews_lock:
             previews.pop(token_hash(token), None)
+        with chat_lock:
+            chat_threads.pop(token_hash(token), None)
+        with recommendation_lock:
+            guest_recommendations.pop(token_hash(token), None)
 
     def guest_session(token: str | None) -> dict | None:
         if not isinstance(token, str) or not token:
@@ -575,6 +484,10 @@ def make_workbench_handler(
             guest_profiles.delete(value["profile_id"])
             with previews_lock:
                 previews.pop(key, None)
+            with chat_lock:
+                chat_threads.pop(key, None)
+            with recommendation_lock:
+                guest_recommendations.pop(key, None)
         if not session or session["expires_at"] <= now:
             return None
         return dict(session)
@@ -622,7 +535,7 @@ def make_workbench_handler(
             return ()
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "AcademicWorkbench/1.0"
+        server_version = "BITSbuddy/1.0"
 
         def log_message(self, fmt: str, *args) -> None:
             return
@@ -736,10 +649,10 @@ def make_workbench_handler(
                     self._import_page(session)
                 elif parsed.path == "/documents":
                     self._documents_page(session, query)
+                elif parsed.path == "/history":
+                    self._history_page(session)
                 elif parsed.path.startswith("/sources/"):
                     self._source_page(session, parsed.path.removeprefix("/sources/"), query)
-                elif parsed.path == "/review":
-                    self._review_page(session, query)
                 else:
                     self._render("Not found", '<div class="empty">Page not found.</div>', session, 404)
             except PermissionError as exc:
@@ -762,7 +675,7 @@ def make_workbench_handler(
                 self._import_post(session)
                 return
             try:
-                data = self._form(limit=5 * 1024 * 1024 if path == "/review" else MAX_FORM_BYTES)
+                data = self._form()
             except (ValueError, TypeError, UnicodeError, OverflowError) as exc:
                 status = 413 if isinstance(exc, OverflowError) else 400
                 self._render("Invalid request", f'<p class="error">{_esc(exc)}</p>', session, status)
@@ -780,17 +693,20 @@ def make_workbench_handler(
                         if token:
                             with previews_lock:
                                 previews.pop(token_hash(token), None)
+                            with chat_lock:
+                                chat_threads.pop(token_hash(token), None)
                     self._send(_page("Signed out", '<p class="ok">You are signed out.</p><p><a href="/login">Sign in</a></p>'), extra={"Set-Cookie": "workbench_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"})
                 elif path == "/":
                     self._save_profile(session, data)
                 elif path == "/recommend":
-                    self._recommend_page(session, {"q": [self._value(data, "q")]})
+                    self._recommend_page(session, {"q": [self._value(data, "q")], "record": ["1"]})
                 elif path == "/import":
                     self._confirm_import(session, data)
                 elif path == "/documents":
-                    self._documents_page(session, {"q": [self._value(data, "q")], "document_type": [self._value(data, "document_type")], "semester": [self._value(data, "semester")]})
-                elif path == "/review":
-                    self._review_post(session, data)
+                    self._documents_page(session, {"q": [self._value(data, "q")], "clear": [self._value(data, "clear")]})
+                elif path == "/history" and self._value(data, "clear") == "1":
+                    self._clear_history(session)
+                    self._history_page(session)
                 else:
                     self._render("Not found", '<div class="empty">Page not found.</div>', session, 404)
             except PermissionError as exc:
@@ -844,14 +760,6 @@ def make_workbench_handler(
             profile = repository.get(session["profile_id"])
             if profile is not None and not owns_profile(session, profile.profile_id):
                 raise PermissionError("This profile does not belong to the current session.")
-            snapshot = active_snapshot()
-            staged = staged_snapshot()
-            if snapshot:
-                dataset = f'<p class="muted">Course library: <span class="pill">{_esc(snapshot.dataset_version)}</span></p>'
-            elif staged:
-                dataset = f'<p class="ok">Course library ready: {len(staged.get("courses", []))} courses loaded from the supplied documents.</p>'
-            else:
-                dataset = '<div class="empty">No course documents have been indexed yet.</div>'
             review = self._current_preview()
             transcript_attempts = _attempts_from_preview(review)
             metadata = (review or {}).get("profile_candidates", {})
@@ -870,10 +778,11 @@ def make_workbench_handler(
                 detected = " + ".join(programme_labels.get(item, item) for item in programmes)
                 detected_profile = " · ".join(filter(None, (campus_value + " campus" if hints else None, detected or None, f"joined {admission_value}" if admission_value else None)))
                 skipped = len(review.get("attempt_candidates", [])) - len(transcript_attempts)
-                transcript_note = f'<p class="ok">Loaded {_esc(review.get("filename"))}: {len(transcript_attempts)} course records are filled below{f"; {skipped} uncertain row(s) need manual attention" if skipped else ""}. {_esc(identity)}{f" · Detected: { _esc(detected_profile) }" if detected_profile else ""}</p>'
+                saved_text = " and saved to your profile" if not session.get("is_guest") else ""
+                transcript_note = f'<p class="ok">Loaded {_esc(review.get("filename"))}: {len(transcript_attempts)} course records are filled below{saved_text}{f"; {skipped} uncertain row(s) need manual attention" if skipped else ""}. {_esc(identity)}{f" · Detected: { _esc(detected_profile) }" if detected_profile else ""}</p>'
             else:
                 transcript_note = '<p class="muted">Upload your latest performance sheet and the complete recognized course history will be filled into this profile automatically.</p>'
-            transcript_upload = f'''<section class="panel"><h2>Upload latest transcript</h2>{transcript_note}<form method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="preview"><input type="file" name="file" accept="application/pdf,.pdf" required><button>{'Replace transcript' if review else 'Upload and fill my course history'}</button></form></section>'''
+            transcript_upload = f'''<section class="panel"><h2>Upload latest transcript</h2>{transcript_note}<form method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="preview"><input type="file" name="file" accept="application/pdf,.pdf" required><button>{'Replace transcript' if review or profile else 'Upload and fill my course history'}</button></form></section>'''
             version = profile.profile_version if profile else 0
             catalog = course_catalog()
             admission_number = int(admission_value) if str(admission_value).isdigit() else None
@@ -881,22 +790,18 @@ def make_workbench_handler(
             planning_ids = {value for value, _ in planning_terms}
             saved_target = profile.target_semester_id if profile else ""
             target_value = saved_target if saved_target in planning_ids else planning_terms[0][0]
-            privacy = '<p class="ok">Guest mode: this profile is held only in server memory for this session. Use “Forget this session” to delete it immediately. If you want saved history, switch to an account before entering it; guest data is never copied implicitly.</p>' if session.get("is_guest") else '<p class="muted">Signed-in mode: this profile is saved locally for future visits.</p>'
-            body = f'''<h1>Your study profile</h1><p class="lede">Step 1 of 2 · Upload your latest transcript, then fill only the details it does not contain.</p>{privacy}{dataset}{transcript_upload}
-            <section class="panel"><form method="post" action="/">
+            details = f'''<section class="panel"><form method="post" action="/">
             <input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="profile_version" value="{version}">
             {_select('Campus','campus',CAMPUS_OPTIONS,campus_value,required=True,blank=None)}
             {_field('Year you joined BITS','admission_year',admission_value,kind='number',required=True)}
             {_select('Degree / programme','primary_programme',PROGRAMME_OPTIONS,primary,required=True)}
             {_select('Second degree (only for dual-degree students)','secondary_programme',PROGRAMME_OPTIONS,secondary,blank='No second degree')}
-            <p class="muted">Programme availability depends on campus and admission year; recommendations are enabled only after the matching rules are reviewed.</p>
             {_field('Which semester are you currently in?','current_semester',current_semester_value,kind='number',required=True)}
             {_select('Semester you are planning for','target_semester',planning_terms,target_value,required=True,blank=None)}
             {_select('Minor (optional)','minor',MINOR_OPTIONS,profile.minor_id if profile and profile.minor_id else '',blank='No minor / not enrolled in one')}
             {_attempt_editor(profile, transcript_attempts, catalog, admission_number)}
             <button>Continue to course preferences</button></form></section>'''
-            if profile:
-                body += f'<p class="muted">Saved profile version {profile.profile_version}.</p>'
+            body = f'<h1>Your study profile</h1>{transcript_upload}{details if review or profile else ""}'
             self._render("Your profile", body, session)
 
         def _recommend_page(self, session: dict, query: dict[str, list[str]]) -> None:
@@ -910,23 +815,40 @@ def make_workbench_handler(
                 return
             q = query.get("q", [""])[0].strip()
             saved = query.get("saved", [""])[0] == "1"
-            saved_notice = f'<p class="ok">Profile saved at version {profile.profile_version}.</p>' if saved else ""
+            should_record = query.get("record", [""])[0] == "1"
+            saved_notice = '<p class="ok">Profile saved.</p>' if saved else ""
             body = f'''<h1>Course preferences</h1><p class="lede">Step 2 of 2 · Tell us what you want from your next courses.</p>{saved_notice}
             <form class="panel" method="post" action="/recommend"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}">
             {_textarea('What kind of courses are you looking for?','q',q,4)}
             <button>Get recommendations</button></form>'''
             snapshot = active_snapshot()
+            history_result = None
             if q and snapshot:
-                try:
-                    body += self._recommendations(recommend(profile, q, snapshot))
-                except Exception as exc:
-                    body += f'<p class="error">Recommendation unavailable: {_esc(exc)}</p>'
+                if academic_agent is None:
+                    body += '<p class="error">AI recommendations are not configured. Add a Groq API key and try again.</p>'
+                else:
+                    try:
+                        result = academic_agent.run(profile, q, snapshot)
+                        body += self._recommendations(result)
+                        history_result = result
+                    except Exception:
+                        body += '<p class="error">The AI recommendation service is temporarily busy. Try again in a moment.</p>'
             elif q:
                 staged = staged_snapshot()
                 if staged:
-                    body += self._recommendations(_course_matches_from_staged(profile, q, staged))
+                    if staged_agent is None:
+                        body += '<p class="error">AI recommendations are not configured. Add a Groq API key and try again.</p>'
+                    else:
+                        try:
+                            result = staged_agent.run(profile, q, staged)
+                            body += self._recommendations(result)
+                            history_result = result
+                        except Exception:
+                            body += '<p class="error">The AI recommendation service is temporarily busy. Try again in a moment.</p>'
                 else:
                     body += '<section class="panel"><h2>Recommendations</h2><p class="muted">Upload or index course documents before requesting recommendations.</p></section>'
+            if should_record and q and history_result is not None:
+                self._record_recommendation(session, q, history_result)
             self._render("Course preferences", body, session)
 
         @staticmethod
@@ -934,14 +856,76 @@ def make_workbench_handler(
             cards = []
             for item in result["recommendations"]:
                 reference_count = len(item.get("evidence_references", []))
-                source_note = item.get("source_note") or (f"Supported by {reference_count} reviewed source reference{'s' if reference_count != 1 else ''}." if reference_count else "No reviewed source reference is available.")
+                source_note = item.get("source_note") or ("Based on the supplied academic documents." if reference_count else "Course information is limited.")
                 matched = ", ".join(item.get("matched_topics", [])) or "Matches your academic requirements"
                 badge = item.get("badge", "Eligible")
                 cards.append(f'<article class="card"><span class="pill">{_esc(badge)}</span><h3>{_esc(item["course_code"])} — {_esc(item["title"])}</h3><p>{_esc(matched)}</p><p class="muted">{_esc(source_note)}</p></article>')
             if not cards:
-                reason = result.get("no_result_reason") or "No verified recommendations for this request."
+                reason = result.get("no_result_reason") or "No recommendations found for this request."
                 cards.append(f'<div class="empty">{_esc(reason)}</div>')
             return '<section class="panel"><h2>Recommendations</h2>' + ''.join(cards) + '</section>'
+
+        @staticmethod
+        def _history_entry(query: str, result: dict) -> dict:
+            recommendations = []
+            for item in result.get("recommendations", [])[:20]:
+                recommendations.append({
+                    "course_code": str(item.get("course_code") or ""),
+                    "title": str(item.get("title") or ""),
+                    "reason": ", ".join(str(value) for value in item.get("matched_topics", []) if value),
+                })
+            return {
+                "query": query,
+                "recommendations": recommendations,
+                "no_result_reason": str(result.get("no_result_reason") or ""),
+            }
+
+        def _record_recommendation(self, session: dict, query: str, result: dict) -> None:
+            entry = self._history_entry(query, result)
+            if session.get("is_guest"):
+                token = self._cookie_token()
+                key = token_hash(token) if token else ""
+                entry["created_at"] = time.time()
+                with recommendation_lock:
+                    guest_recommendations[key] = [entry, *guest_recommendations.get(key, [])][:50]
+            else:
+                accounts.add_recommendation(session["user_id"], entry)
+
+        def _history_records(self, session: dict) -> list[dict]:
+            if not session.get("is_guest"):
+                return accounts.recommendation_history(session["user_id"])
+            token = self._cookie_token()
+            key = token_hash(token) if token else ""
+            with recommendation_lock:
+                return list(guest_recommendations.get(key, []))
+
+        def _clear_history(self, session: dict) -> None:
+            if not session.get("is_guest"):
+                accounts.clear_recommendation_history(session["user_id"])
+                return
+            token = self._cookie_token()
+            key = token_hash(token) if token else ""
+            with recommendation_lock:
+                guest_recommendations.pop(key, None)
+
+        def _history_page(self, session: dict) -> None:
+            entries = self._history_records(session)
+            cards = []
+            for entry in entries:
+                timestamp = time.strftime("%d %b %Y, %I:%M %p", time.localtime(float(entry.get("created_at") or 0)))
+                courses = []
+                for item in entry.get("recommendations", []):
+                    reason = f'<br><span class="muted">{_esc(item.get("reason"))}</span>' if item.get("reason") else ""
+                    courses.append(f'<li><strong>{_esc(item.get("course_code"))} — {_esc(item.get("title"))}</strong>{reason}</li>')
+                result = f'<ul>{"".join(courses)}</ul>' if courses else f'<p class="muted">{_esc(entry.get("no_result_reason") or "No recommendations were found.")}</p>'
+                rerun = f'''<form method="post" action="/recommend"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="q" value="{_esc(entry.get('query'))}"><button class="secondary">Run again</button></form>'''
+                cards.append(f'<article class="panel"><p class="muted">{_esc(timestamp)}</p><h2>{_esc(entry.get("query"))}</h2>{result}{rerun}</article>')
+            if cards:
+                clear = f'''<form method="post" action="/history"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear history</button></form>'''
+                body = "".join(cards) + clear
+            else:
+                body = '<div class="empty">Your past recommendations will appear here.</div>'
+            self._render("Recommendation history", f'<h1>Recommendation history</h1>{body}', session)
 
         def _save_profile(self, session: dict, data: dict[str, list[str]]) -> None:
             profile_id = session["profile_id"]
@@ -1011,7 +995,12 @@ def make_workbench_handler(
 
         def _import_page(self, session: dict) -> None:
             review = self._current_preview()
-            ready = f'<p class="ok">{len(_attempts_from_preview(review))} course records are ready. <a href="/">Return to your profile to save them.</a></p>' if review else ""
+            if review and session.get("is_guest"):
+                ready = f'<p class="ok">{len(_attempts_from_preview(review))} course records are ready. <a href="/">Return to your profile to save them.</a></p>'
+            elif review:
+                ready = f'<p class="ok">{len(_attempts_from_preview(review))} course records were saved. <a href="/">View your profile.</a></p>'
+            else:
+                ready = ""
             body = f'''<h1>Upload latest transcript</h1><p class="lede">Upload your latest BITS performance sheet. The PDF is discarded immediately after parsing; recognized past and current courses are filled into your profile.</p>{ready}
             <form class="panel" method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="preview"><label>Latest transcript (PDF)</label><input type="file" name="file" accept="application/pdf,.pdf" required><button>Upload and fill my profile</button></form>'''
             self._render("Upload transcript", body, session)
@@ -1022,7 +1011,7 @@ def make_workbench_handler(
             for item in review.get("attempt_candidates", []):
                 idx = item["index"]
                 selected = " checked" if item.get("selected") else ""
-                mapping = item.get("course_id") or f"Not in the reviewed course list yet · {item.get('canonical_course_code')}"
+                mapping = item.get("course_id") or f"Not in the course list yet · {item.get('canonical_course_code')}"
                 allow_unknown = f'<label><input style="width:auto" type="checkbox" name="unknown_{idx}" value="1"> Keep this course in my history anyway</label>' if not item.get("course_id") else ""
                 rows.append(f'''<tr><td><input style="width:auto" type="checkbox" name="selected_{idx}" value="1"{selected}></td>
                 <td>{_esc(mapping)}{allow_unknown}</td><td>{_esc(item.get('course_title'))}</td>
@@ -1034,10 +1023,10 @@ def make_workbench_handler(
                 table = '<div class="empty">No course attempts were recognized. You can enter history manually on your profile.</div>'
             else:
                 table = f'''<form method="post" action="/import" class="panel"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="confirm">
-                <p class="muted">Extracted grades do not determine pass or fail. Choose a status for every selected row; verify editable grade, units and term.</p>
+                <p class="muted">Extracted grades do not determine pass or fail. Choose a status for every selected row and check the grade, units, and term.</p>
                 <table><thead><tr><th>Add</th><th>Course</th><th>Title</th><th>Grade</th><th>Units</th><th>Academic term</th><th>Result</th></tr></thead><tbody>{''.join(rows)}</tbody></table><button>Add selected courses to my history</button></form>'''
             issues = "".join(f'<li>{_esc(item.get("message"))}</li>' for item in review.get("issues", []))
-            return f'<section class="panel"><h2>Review: {_esc(review.get("filename"))}</h2>{table}<ul>{issues}</ul></section>'
+            return f'<section class="panel"><h2>Transcript details: {_esc(review.get("filename"))}</h2>{table}<ul>{issues}</ul></section>'
 
         def _multipart(self) -> tuple[dict[str, str], bytes | None, str | None]:
             raw = self._read_body(MAX_MULTIPART_BYTES)
@@ -1062,6 +1051,43 @@ def make_workbench_handler(
                     fields[name] = content.decode(charset, "strict")
             return fields, file_bytes, filename
 
+        def _save_uploaded_transcript_profile(self, session: dict, review: dict) -> StudentProfile:
+            if session.get("is_guest"):
+                raise MarksheetImportError("A saved profile requires a signed-in account.")
+            existing = profiles.get(session["profile_id"])
+            metadata = review.get("profile_candidates", {})
+            hints = _transcript_profile_hints(str(metadata.get("student_id") or ""))
+            programmes = tuple(hints.get("programme_ids") or (existing.programme_ids if existing else ()))
+            campus = str(hints.get("campus") or (existing.campus if existing else ""))
+            admission_year = hints.get("admission_year") or (existing.admission_year if existing else None)
+            if not programmes or not campus or not isinstance(admission_year, int):
+                raise MarksheetImportError("Could not detect enough student details to create a saved profile from this transcript.")
+            incoming = _attempts_from_preview(review)
+            incoming_ids = {item.attempt_id for item in incoming if item.attempt_id}
+            incoming_keys = {(item.course_id, item.term_id) for item in incoming}
+            incoming_courses = {item.course_id for item in incoming}
+            previous = existing.attempts if existing else ()
+            kept = tuple(item for item in previous if not (
+                (item.attempt_id and item.attempt_id in incoming_ids)
+                or (item.course_id, item.term_id) in incoming_keys
+                or (item.attempt_id is None and item.course_id in incoming_courses)
+            ))
+            terms = {item.term_id for item in incoming if item.term_id}
+            planning_terms = _planning_term_options()
+            profile = StudentProfile(
+                profile_id=session["profile_id"],
+                campus=campus,
+                admission_year=admission_year,
+                programme_ids=programmes,
+                current_semester=existing.current_semester if existing else max(1, len(terms)),
+                target_semester_id=existing.target_semester_id if existing else planning_terms[0][0],
+                attempts=kept + incoming,
+                minor_id=existing.minor_id if existing else None,
+                interests=existing.interests if existing else (),
+                profile_version=existing.profile_version if existing else 0,
+            )
+            return profiles.save(profile, expected_version=existing.profile_version if existing else 0)
+
         def _import_post(self, session: dict) -> None:
             try:
                 data, payload, filename = self._multipart()
@@ -1078,6 +1104,8 @@ def make_workbench_handler(
                     review = preview_marksheet(payload, filename, active_snapshot())
                     with previews_lock:
                         previews[key] = (time.time() + PREVIEW_TTL_SECONDS, review)
+                    if not session.get("is_guest"):
+                        self._save_uploaded_transcript_profile(session, review)
                     self.send_response(303)
                     self.send_header("Location", "/")
                     self.send_header("Cache-Control", "no-store")
@@ -1117,37 +1145,59 @@ def make_workbench_handler(
                 saved = profile_repository(session).save(updated, expected_version=profile.profile_version)
                 with previews_lock:
                     previews.pop(key, None)
-                self._render("Course history updated", f'<p class="ok">Added {len(attempts)} reviewed course attempt(s) to profile version {saved.profile_version}.</p><p><a href="/">Return to profile</a></p>', session)
+                self._render("Course history updated", f'<p class="ok">Added {len(attempts)} course attempt(s) to your profile.</p><p><a href="/">Return to profile</a></p>', session)
             except (ValueError, TypeError, UnicodeError, OverflowError, MarksheetImportError, ProfileConflictError, ProfileValidationError, OSError) as exc:
-                self._render("Could not import marksheet", f'<p class="error">{_esc(exc)}</p><p><a href="/import">Return to review</a></p>', session, 400)
+                self._render("Could not import marksheet", f'<p class="error">{_esc(exc)}</p><p><a href="/import">Try another upload</a></p>', session, 400)
 
         def _documents_page(self, session: dict, query: dict[str, list[str]]) -> None:
             q = query.get("q", [""])[0].strip()
-            doc_type = query.get("document_type", [""])[0].strip() or None
-            semester = query.get("semester", [""])[0].strip() or None
-            stats = library_stats(corpus_path) if corpus_path.is_file() else None
-            stats_html = f'<p class="muted">Indexed documents: {stats["documents"]} · pages/logical units: {stats["pages_or_logical_units"]}</p>' if stats else '<p class="muted">The source library has not been indexed yet.</p>'
-            filters = f'''<form method="get" action="/documents" class="panel"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}">
-            {_textarea('Ask a question across the supplied source library','q',q,3)}
-            {_select('Look in','document_type',DOCUMENT_TYPE_OPTIONS,doc_type,blank='All documents')}{_select('Academic term (optional)','semester',_term_options(),semester,blank='Any term')}<button>Search cited sources</button></form>'''
-            result_html = ""
-            if q and stats:
-                result = answer_question(corpus_path, q, limit=8, document_type=doc_type, semester=semester)
-                if result["citations"]:
-                    items = []
-                    for citation in result["citations"]:
-                        page = citation.get("page")
-                        unit_key = citation.get("unit_key")
-                        section = citation.get("section")
-                        page_label = f"Page {page}" if page is not None else f"Section {section or unit_key or 'logical unit'}"
-                        suffix = f'?page={page}' if page is not None else (f'?unit={_esc(unit_key)}' if unit_key else f'?section={_esc(section)}' if section else '')
-                        href = f'/sources/{_esc(citation["document_id"])}' + suffix
-                        items.append(f'<article class="card"><h3>{_esc(citation["file_name"])}</h3><p class="muted">{_esc(page_label)}</p><p>{_esc(citation["excerpt"])}</p><a class="link" href="{href}">Open cited source</a></article>')
-                    result_html = "".join(items)
-                else:
-                    result_html = '<div class="empty">No matching source text was found, so no answer was generated.</div>'
-                result_html += f'<p class="muted">{_esc(result["warning"])}</p>'
-            self._render("Document library", f'<h1>Document library</h1>{stats_html}{filters}{result_html}', session)
+            token = self._cookie_token()
+            key = token_hash(token) if token else ""
+            if query.get("clear", [""])[0] == "1":
+                with chat_lock:
+                    chat_threads.pop(key, None)
+            with chat_lock:
+                history = list(chat_threads.get(key, []))
+            error = ""
+            if q:
+                try:
+                    if document_chat_agent is None:
+                        raise RuntimeError("The chat service is not configured.")
+                    response = document_chat_agent.answer(q, history)
+                    history = [*history, response][-10:]
+                    with chat_lock:
+                        chat_threads[key] = history
+                except Exception:
+                    error = "I couldn't answer that right now. Please try again."
+            conversation = []
+            for item in history:
+                answer_html = _esc(item.get("answer")).replace("\n", "<br>")
+                grouped_sources: dict[tuple, dict] = {}
+                for citation in item.get("citations", []):
+                    page = citation.get("page")
+                    unit_key = citation.get("unit_key")
+                    section = citation.get("section")
+                    source_key = (citation.get("document_id"), page, unit_key, section)
+                    grouped = grouped_sources.setdefault(source_key, {"citation": citation, "numbers": []})
+                    grouped["numbers"].append(str(citation.get("number")))
+                sources = []
+                for grouped in grouped_sources.values():
+                    citation = grouped["citation"]
+                    page = citation.get("page")
+                    unit_key = citation.get("unit_key")
+                    section = citation.get("section")
+                    label = f'{citation.get("file_name")} · page {page}' if page is not None else f'{citation.get("file_name")} · {section or unit_key or "source"}'
+                    suffix = f'?page={page}' if page is not None else (f'?unit={_esc(unit_key)}' if unit_key else f'?section={_esc(section)}' if section else '')
+                    href = f'/sources/{_esc(citation["document_id"])}' + suffix
+                    sources.append(f'<a class="link" href="{href}">[{_esc(",".join(grouped["numbers"]))}] {_esc(label)}</a>')
+                source_html = f'<p class="muted">Sources: {" · ".join(sources)}</p>' if sources else ""
+                conversation.append(f'<p><strong>You</strong><br>{_esc(item.get("question"))}</p><article class="card"><strong>BITSbuddy</strong><p>{answer_html}</p>{source_html}</article>')
+            error_html = f'<p class="error">{_esc(error)}</p>' if error else ""
+            empty = '<div class="empty">Ask about courses, regulations, handouts, timetables, or anything else.</div>' if not history else ""
+            form = f'''<form method="post" action="/documents" class="panel"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}">
+            {_textarea('Ask anything','q','',3)}<button>Send</button></form>'''
+            clear = f'''<form method="post" action="/documents"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear chat</button></form>''' if history else ""
+            self._render("Ask BITSbuddy", f'<h1>Ask BITSbuddy</h1>{form}{error_html}{empty}{"".join(conversation)}{clear}', session)
 
         def _source_page(self, session: dict, document_id: str, query: dict[str, list[str]]) -> None:
             if "/file" in document_id:
@@ -1196,99 +1246,14 @@ def make_workbench_handler(
                     continue
             self._send(b"Not found", 404, "text/plain; charset=utf-8")
 
-        def _review_page(self, session: dict, query: dict[str, list[str]] | None = None) -> None:
-            if session["role"] != "admin":
-                raise PermissionError("Only the first account administrator can edit source reviews.")
-            if not corpus_path.is_file() or not index_path.is_file():
-                body = '<h1>Source review</h1><div class="empty">Build the source library and handout index before creating a review draft.</div>'
-            else:
-                body = f'''<h1>Source review</h1><p class="lede">Extracted claims remain marked for review until you edit and explicitly confirm them. Publishing validates the reviewed snapshot.</p>
-                <section class="panel"><h2>Build a draft</h2><form method="post" action="/review"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="build">{_select('Campus covered by this draft','campus',CAMPUS_OPTIONS,'Pilani',required=True,blank=None)}{_select('Academic term covered','semester',_term_options(),'2026-T1',required=True)}{_field('Admission year covered','admission_year','2025',kind='number')}<button>Extract review draft</button></form></section>'''
-            if review_path.is_file():
-                bundle = json.loads(review_path.read_text(encoding="utf-8"))
-                all_evidence = bundle.get("snapshot", {}).get("evidence", [])
-                query = query or {}
-                page_text = query.get("evidence_page", ["1"])[0]
-                evidence_page = max(1, int(page_text)) if page_text.isdecimal() else 1
-                page_size = 40
-                start = (evidence_page - 1) * page_size
-                evidence_links = []
-                for item in all_evidence[start:start + page_size]:
-                    doc_id = item.get("document_id")
-                    page = item.get("page")
-                    if doc_id:
-                        href = f'/sources/{_esc(doc_id)}' + (f'?page={page}' if page is not None else '')
-                        checked = " checked" if item.get("verification_status") == "verified" else ""
-                        evidence_id = item.get("evidence_id", "")
-                        evidence_links.append(
-                            f'<li><input type="hidden" name="reviewed_id" value="{_esc(evidence_id)}">'
-                            f'<label><input style="width:auto" type="checkbox" name="verified_id" value="{_esc(evidence_id)}"{checked}> '
-                            f'Verified against source</label><a href="{href}">{_esc(doc_id)} · {_esc(item.get("section"))} · {_esc(item.get("excerpt"))}</a></li>'
-                        )
-                edit_snapshot = query.get("edit", [""])[0] == "snapshot"
-                if edit_snapshot:
-                    raw_snapshot = json.dumps(bundle.get("snapshot", {}), ensure_ascii=False, indent=2)
-                    snapshot_editor = f'''<form method="post" action="/review"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="save">{_textarea('Reviewed snapshot JSON','snapshot_json',raw_snapshot,28)}<button>Save reviewed draft</button></form><p><a class="link" href="/review?evidence_page={evidence_page}">Close advanced editor</a></p>'''
-                else:
-                    snapshot_editor = '<p><a class="link" href="/review?edit=snapshot">Open advanced structured JSON editor</a></p>'
-                evidence_nav = f'<p class="muted">Showing claims {start + 1}–{min(start + page_size, len(all_evidence))} of {len(all_evidence)} · ' + (f'<a href="/review?evidence_page={evidence_page - 1}">Previous</a> · ' if evidence_page > 1 else '') + (f'<a href="/review?evidence_page={evidence_page + 1}">Next</a>' if start + page_size < len(all_evidence) else '') + '</p>'
-                body += f'''<section class="panel"><h2>Draft status: {_esc(bundle.get('status'))}</h2><p class="muted">Publishing includes only claims explicitly marked verified with supporting evidence.</p><h3>Source evidence</h3>{evidence_nav}<form method="post" action="/review"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="verify_evidence"><input type="hidden" name="evidence_page" value="{evidence_page}"><ul>{''.join(evidence_links)}</ul><button>Save verification for this page</button></form>{evidence_nav}
-                {snapshot_editor}
-                <form method="post" action="/review"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="publish"><label><input style="width:auto" type="checkbox" name="reviewed" value="1" required> I reviewed the claims and scope in this snapshot</label><button>Validate and publish reviewed subset</button></form></section>'''
-            self._render("Source review", body, session)
-
-        def _review_post(self, session: dict, data: dict[str, list[str]]) -> None:
-            if session["role"] != "admin":
-                raise PermissionError("Only the first account administrator can edit source reviews.")
-            action = self._value(data, "action")
-            if action == "build":
-                bundle = build_review_bundle(
-                    corpus_path, index_path, review_path,
-                    campus=self._value(data, "campus", "Pilani"),
-                    semester=self._value(data, "semester", "2026-T1"),
-                    admission_year=int(self._value(data, "admission_year", "2025")),
-                )
-                self._render("Review draft built", f'<p class="ok">Draft built with {len(bundle["snapshot"].get("evidence", []))} cited claims.</p><a class="link" href="/review">Open draft</a>', session)
-            elif action == "save":
-                if not review_path.is_file():
-                    raise ValueError("Build a review draft first.")
-                bundle = json.loads(review_path.read_text(encoding="utf-8"))
-                snapshot = json.loads(self._value(data, "snapshot_json"))
-                save_review(bundle, snapshot, review_path, session["user_id"])
-                self._render("Draft saved", '<p class="ok">Reviewed snapshot draft saved. All verification labels remain as you entered them.</p><a class="link" href="/review">Continue review</a>', session)
-            elif action == "verify_evidence":
-                if not review_path.is_file():
-                    raise ValueError("Build a review draft first.")
-                bundle = json.loads(review_path.read_text(encoding="utf-8"))
-                evidence = bundle.get("snapshot", {}).get("evidence", [])
-                reviewed_ids = set(data.get("reviewed_id", []))
-                verified_ids = set(data.get("verified_id", []))
-                known_ids = {item.get("evidence_id") for item in evidence}
-                if not reviewed_ids or len(reviewed_ids) > 40 or not reviewed_ids.issubset(known_ids) or not verified_ids.issubset(reviewed_ids):
-                    raise ValueError("The evidence review page is invalid; reload and try again.")
-                for item in evidence:
-                    if item.get("evidence_id") in reviewed_ids:
-                        item["verification_status"] = "verified" if item.get("evidence_id") in verified_ids else "needs_review"
-                save_review(bundle, bundle["snapshot"], review_path, session["user_id"])
-                evidence_page = self._value(data, "evidence_page", "1")
-                self.send_response(303)
-                self.send_header("Location", f"/review?evidence_page={evidence_page if evidence_page.isdecimal() else '1'}")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-            elif action == "publish":
-                if self._value(data, "reviewed") != "1":
-                    raise ValueError("Confirm that you reviewed the snapshot before publishing.")
-                if not review_path.is_file():
-                    raise ValueError("Build a review draft first.")
-                result = publish_review(review_path, snapshot_path, session["user_id"], reviewed_only=True)
-                self._render("Dataset published", f'<p class="ok">Published dataset {_esc(result["dataset_version"])} with {result["courses"]} courses and {result["offerings"]} offerings.</p><a class="link" href="/review">Return to review</a>', session)
-            else:
-                raise ValueError("Unknown source review action.")
-
         @staticmethod
         def close_resources() -> None:
             with previews_lock:
                 previews.clear()
+            with chat_lock:
+                chat_threads.clear()
+            with recommendation_lock:
+                guest_recommendations.clear()
             profiles.close()
             guest_profiles.close()
             accounts.close()

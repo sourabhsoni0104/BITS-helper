@@ -51,7 +51,7 @@ def _final_validate(
             raise RuntimeError("Final validation rejected a non-eligible recommendation.")
         for constraint in intent.hard_constraints:
             if _constraint_status(offering.handout_facts.get(constraint.field), constraint.value) != DecisionStatus.PASS:
-                raise RuntimeError("Final validation rejected an unmet or unverified hard constraint.")
+                raise RuntimeError("Final validation rejected an unmet or unsupported hard constraint.")
 
 
 def _excluded_course_ids(profile: StudentProfile, context: Any, snapshot: DatasetSnapshot) -> set[str]:
@@ -70,6 +70,10 @@ def _excluded_course_ids(profile: StudentProfile, context: Any, snapshot: Datase
 
 
 def recommend(profile: StudentProfile, query: str, snapshot: DatasetSnapshot) -> dict[str, Any]:
+    return recommend_from_intent(profile, parse_query(query), snapshot)
+
+
+def recommend_from_intent(profile: StudentProfile, intent: QueryIntent, snapshot: DatasetSnapshot) -> dict[str, Any]:
     context = resolve_policy_context(profile, snapshot)
     minor_context = resolve_minor_policy_context(profile, snapshot)
     warnings: list[str] = []
@@ -80,7 +84,6 @@ def recommend(profile: StudentProfile, query: str, snapshot: DatasetSnapshot) ->
         context = replace(context, requirements=context.requirements + minor_requirements,
                           repeat_policy=context.repeat_policy if context.repeat_policy == minor_context.repeat_policy else "unresolved")
     requirements = analyze_requirements(profile, context, snapshot)
-    intent = parse_query(query)
     base: dict[str, Any] = {
         "profile_id": profile.profile_id,
         "profile_version": profile.profile_version,
@@ -129,7 +132,7 @@ def recommend(profile: StudentProfile, query: str, snapshot: DatasetSnapshot) ->
             base["unverified_alternatives"].append({
                 "course_code": course.code,
                 "title": course.title,
-                "reason": "One or more requested properties could not be verified.",
+                "reason": "The supplied documents do not confirm one or more requested properties.",
                 "hard_constraint_checks": hard_checks,
             })
             continue
@@ -193,11 +196,11 @@ def recommend(profile: StudentProfile, query: str, snapshot: DatasetSnapshot) ->
         if not candidates:
             base["no_result_reason"] = "No offerings were supplied for this campus and target semester."
         elif eligible_count == 0:
-            base["no_result_reason"] = "No supplied offerings are verified academically eligible for this profile and requested category."
+            base["no_result_reason"] = "No supplied offerings are academically eligible for this profile and requested category."
         elif hard_unknown_count:
-            base["no_result_reason"] = "Eligible offerings exist, but the requested property could not be verified from supplied evidence."
+            base["no_result_reason"] = "Eligible offerings exist, but the supplied documents do not confirm the requested property."
         elif hard_failed_count:
             base["no_result_reason"] = "Eligible offerings exist, but none satisfies every hard preference."
         else:
-            base["no_result_reason"] = "No verified match was found."
+            base["no_result_reason"] = "No supported match was found."
     return base

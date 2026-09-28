@@ -21,6 +21,22 @@ def course_codes(text: str) -> list[str]:
     return list(dict.fromkeys(f"{m[0]} {m[1]}" for m in CODE.findall(text)))
 
 
+def _handout_metadata(text: str, fallback_title: str) -> tuple[str, list[str]]:
+    title_match = re.search(r"(?im)^\s*Course\s+Title\s*:\s*(.+?)\s*$", text)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip(" .") if title_match else fallback_title
+    description_match = re.search(
+        r"(?is)\bCourse\s+Description\s*:?\s*(.+?)(?=\n\s*(?:2\.|Scope\s*(?:&|and)?\s*Objectives?|Course\s+Objectives?|Text\s*Book))",
+        text,
+    )
+    description = re.sub(r"\s+", " ", description_match.group(1)).strip() if description_match else ""
+    topics = [
+        item.strip(" .:-")
+        for item in re.split(r"[;•]|(?<=[.!?])\s+", description)
+        if 3 <= len(item.strip(" .:-")) <= 240
+    ]
+    return title or fallback_title, topics[:16]
+
+
 def build_review_bundle(corpus: str | Path, index: str | Path, output: str | Path,
                         *, campus: str = "Pilani", semester: str = "2026-T1",
                         admission_year: int = 2025) -> dict[str, Any]:
@@ -45,11 +61,15 @@ def build_review_bundle(corpus: str | Path, index: str | Path, output: str | Pat
                              section=purpose, excerpt=excerpt.strip(), verification_status='needs_review')
         return key
 
-    def add_course(code: str, title: str, refs: list[str]) -> None:
+    def add_course(code: str, title: str, refs: list[str], topics: list[str] | None = None) -> None:
         if code not in courses:
-            courses[code] = dict(course_id=code, code=code, title=title, units=None, topics=[], evidence_ids=refs)
+            courses[code] = dict(course_id=code, code=code, title=title, units=None, topics=topics or [], evidence_ids=refs)
         else:
             courses[code]['evidence_ids'] = sorted(set(courses[code]['evidence_ids'] + refs))
+            if topics:
+                courses[code]['topics'] = list(dict.fromkeys(courses[code]['topics'] + topics))
+            if courses[code]['title'] == code or len(title) > len(courses[code]['title']):
+                courses[code]['title'] = title
 
     for entry in parse_handout_index(index):
         codes = course_codes(entry.course_code)
@@ -64,7 +84,8 @@ def build_review_bundle(corpus: str | Path, index: str | Path, output: str | Pat
         if not page_text:
             continue
         ref = cite(doc, 1, page_text[:2500], 'Course identity and offering scope — confirm campus and term')
-        add_course(code, entry.course_title, [ref])
+        title, topics = _handout_metadata(page_text, entry.course_title)
+        add_course(code, title, [ref], topics)
         facts = {}
         for (doc_id, page), text in pages.items():
             if doc_id != doc:
@@ -79,7 +100,7 @@ def build_review_bundle(corpus: str | Path, index: str | Path, output: str | Pat
                     fact_ref = cite(doc, page, match.group(0), f'Review {field}; mention alone does not establish the value')
                     facts.setdefault(field, dict(value=None, verification_status='needs_review', evidence_ids=[fact_ref]))
         offerings.append(dict(offering_id=f'{code.replace(" ", "-")}-{entry.component_code}-{semester}',
-            course_id=code, campus=campus, semester_id=semester,
+            course_id=code, campus=campus, semester_id=semester, component_code=entry.component_code,
             availability=dict(value=None, verification_status='needs_review', evidence_ids=[ref]),
             categories=[], prerequisite=None, handout_facts=facts, evidence_ids=[ref]))
 

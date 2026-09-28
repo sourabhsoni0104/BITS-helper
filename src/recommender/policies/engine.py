@@ -305,7 +305,7 @@ def evaluate_eligibility(profile: StudentProfile, offering: Offering, requested_
     checks: list[CheckResult] = []
     availability = offering.availability
     if availability.verification_status != VerificationStatus.VERIFIED or availability.value is None:
-        checks.append(CheckResult("availability", DecisionStatus.UNKNOWN, "OFFERING_UNVERIFIED", "Current offering availability is not verified.", availability.evidence_ids))
+        checks.append(CheckResult("availability", DecisionStatus.UNKNOWN, "OFFERING_UNVERIFIED", "The supplied timetable does not confirm this offering.", availability.evidence_ids))
     elif availability.value is True:
         checks.append(CheckResult("availability", DecisionStatus.PASS, "OFFERING_AVAILABLE", "The supplied timetable marks this offering as available.", availability.evidence_ids))
     else:
@@ -325,9 +325,9 @@ def evaluate_eligibility(profile: StudentProfile, offering: Offering, requested_
                 if membership.verification_status == VerificationStatus.VERIFIED
                 and (not membership.programme_ids or bool(set(membership.programme_ids) & set(profile.programme_ids)))
             )
-            checks.append(CheckResult("category", DecisionStatus.PASS, "CATEGORY_APPLICABLE", f"Verified as {requested_category} for this programme context.", evidence))
+            checks.append(CheckResult("category", DecisionStatus.PASS, "CATEGORY_APPLICABLE", f"Listed as {requested_category} for this programme context.", evidence))
         elif memberships:
-            checks.append(CheckResult("category", DecisionStatus.UNKNOWN, "CATEGORY_UNVERIFIED", f"{requested_category} membership is not verified for this programme context."))
+            checks.append(CheckResult("category", DecisionStatus.UNKNOWN, "CATEGORY_UNVERIFIED", f"The supplied rules do not confirm {requested_category} membership for this programme context."))
         else:
             checks.append(CheckResult("category", DecisionStatus.FAIL, "CATEGORY_NOT_APPLICABLE", f"The course is not supplied as a {requested_category} for this programme context."))
 

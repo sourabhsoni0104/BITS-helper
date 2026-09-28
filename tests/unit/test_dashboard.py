@@ -86,7 +86,7 @@ class DashboardHandlerTests(unittest.TestCase):
         self.assertEqual(attempts["SYN-200"], CourseAttempt("SYN-200", AttemptStatus.IN_PROGRESS, "B", 2))
         self.assertEqual(attempts["OLD-FAILED"], CourseAttempt("OLD-FAILED", AttemptStatus.FAILED, "F", 0))
         self.assertEqual(attempts["OLD-WITHDRAWN"].status, AttemptStatus.WITHDRAWN)
-        self.assertIn("Saved profile version 2", response)
+        self.assertIn("Profile saved.", response)
 
     def test_intentional_status_change_clears_stale_attempt_metadata(self) -> None:
         saved = self.profiles.save(profile(CourseAttempt("SYN-100", AttemptStatus.COMPLETED, grade="A", units_awarded=3)), expected_version=0)
@@ -125,7 +125,7 @@ class DashboardHandlerTests(unittest.TestCase):
         self.assertIn("changed from version 1 to 2", response)
         self.assertEqual(self.profiles.get("student").profile_version, 2)
 
-    def test_save_notice_is_shown_when_policy_resolution_fails(self) -> None:
+    def test_save_notice_is_shown_when_ai_is_not_configured(self) -> None:
         body = urlencode({
             "profile_id": "unmatched", "profile_version": "0", "campus": "SYNTHETIC",
             "admission_year": "2025", "programmes": "UNKNOWN", "current_semester": "3",
@@ -135,8 +135,8 @@ class DashboardHandlerTests(unittest.TestCase):
         status, response = post(self.handler, body)
         self.assertEqual(status, 200)
         self.assertEqual(self.profiles.get("unmatched").profile_version, 1)
-        self.assertIn("Profile saved; recommendations unavailable", response)
-        self.assertIn("Saved profile version 1", response)
+        self.assertIn("AI recommendations are not configured", response)
+        self.assertIn("Profile saved.", response)
 
     def test_none_contribution_has_accurate_rendering(self) -> None:
         result = {
@@ -146,7 +146,7 @@ class DashboardHandlerTests(unittest.TestCase):
                 "course_code": "X 1", "title": "Course", "matched_topics": [], "evidence_references": [],
             }], "unverified_alternatives": [], "no_result_reason": None,
         }
-        self.assertIn("No verified requirement contribution", render_result(result))
+        self.assertIn("No requirement contribution found", render_result(result))
 
 
 if __name__ == "__main__":

@@ -19,7 +19,6 @@ from unittest.mock import patch
 from app.workbench import (
     BRANCH_CODE_TO_PROGRAMME,
     PROGRAMME_OPTIONS,
-    _course_matches_from_staged,
     _parse_attempt_form,
     _parse_attempt_text,
     _planning_term_options,
@@ -30,6 +29,7 @@ from app.workbench import (
 )
 from recommender.models import AttemptStatus, CourseAttempt, StudentProfile
 from recommender.storage.accounts import AccountRepository
+from recommender.storage.profiles import ProfileRepository
 
 
 class WorkbenchHTTPTests(unittest.TestCase):
@@ -127,9 +127,14 @@ class WorkbenchHTTPTests(unittest.TestCase):
         landing = guest.open(self.base + "/").read().decode()
         self.assertIn("Continue as guest", landing)
         page = guest.open(Request(self.base + "/guest", data=b"", method="POST")).read().decode()
-        self.assertIn("Guest mode", page)
+        self.assertNotIn("Guest mode:", page)
+        self.assertNotIn("Course library ready:", page)
         self.assertIn("Switch to saved account", page)
         self.assertNotIn("Source review", page)
+        self.assertNotIn("Step 1 of 2", page)
+        self.assertNotIn('name="primary_programme"', page)
+        self.assertNotIn("Course history", page)
+        self.assertIn("Upload latest transcript", page)
         csrf = self.csrf(page)
         form = {
             "csrf_token": csrf, "campus": "Pilani", "admission_year": "2025",
@@ -144,7 +149,7 @@ class WorkbenchHTTPTests(unittest.TestCase):
         saved = guest.open(Request(self.base + "/", data=urlencode(form).encode(), headers={
             "Content-Type": "application/x-www-form-urlencoded",
         })).read().decode()
-        self.assertIn("Profile saved at version 1", saved)
+        self.assertIn("Profile saved.", saved)
         edited = guest.open(self.base + "/").read().decode()
         self.assertIn("B.E. Computer Science", edited)
         self.assertIn("CS F111", edited)
@@ -200,6 +205,42 @@ class WorkbenchHTTPTests(unittest.TestCase):
         self.assertNotIn('value="2016-T1"', filled)
         self.assertIn('value="2025-T1"', filled)
 
+    def test_signed_in_transcript_upload_immediately_saves_profile(self):
+        account = self.client()
+        self.register(account, "saved@example.edu")
+        page = account.open(self.base + "/").read().decode()
+        csrf = self.csrf(page)
+        boundary = "----saved-transcript-boundary"
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{csrf}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\npreview\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"latest.pdf\"\r\nContent-Type: application/pdf\r\n\r\n"
+        ).encode() + b"%PDF-1.4 transcript" + f"\r\n--{boundary}--\r\n".encode()
+        review = {
+            "filename": "latest.pdf",
+            "profile_candidates": {"student_id": "2025A7PS0001P", "student_name": "TEST STUDENT"},
+            "attempt_candidates": [{
+                "index": 0, "course_code": "CS F111", "canonical_course_code": "CS F111",
+                "course_id": "CS F111", "course_mapping_status": "mapped", "course_title": "Programming",
+                "grade": "A", "units": 4.0, "term": "2025-T1", "attempt_id": "marksheet-test-0",
+                "attempt_order": 2025 * 3 + 1, "status": "completed", "selected": True,
+            }],
+            "issues": [],
+        }
+        with patch("app.workbench.preview_marksheet", return_value=review):
+            account.open(Request(self.base + "/import", data=body, headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            })).read()
+        with closing(sqlite3.connect(self.root / "accounts.sqlite")) as connection:
+            profile_id = connection.execute("SELECT profile_id FROM accounts WHERE email='saved@example.edu'").fetchone()[0]
+        repository = ProfileRepository(self.root / "profiles.sqlite")
+        saved = repository.get(profile_id)
+        repository.close()
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.campus, "Pilani")
+        self.assertEqual(saved.programme_ids, ("BE-CS",))
+        self.assertEqual(saved.attempts[0].course_id, "CS F111")
+
     def test_student_id_decodes_single_and_integrated_dual_programmes(self):
         self.assertEqual({value for value, _ in PROGRAMME_OPTIONS}, set(BRANCH_CODE_TO_PROGRAMME.values()))
         self.assertEqual(len(PROGRAMME_OPTIONS), 18)
@@ -249,56 +290,28 @@ class WorkbenchHTTPTests(unittest.TestCase):
         }), encoding="utf-8")
         guest = self.client()
         page = guest.open(Request(self.base + "/guest", data=b"", method="POST")).read().decode()
+        csrf = self.csrf(page)
+        guest.open(Request(self.base + "/", data=urlencode({
+            "csrf_token": csrf, "campus": "Pilani", "admission_year": "2025",
+            "primary_programme": "BE-CS", "secondary_programme": "", "minor": "",
+            "current_semester": "2", "target_semester": "2026-T1", "profile_version": "0",
+            "attempts": "", "interests": "",
+        }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})).read()
+        page = guest.open(self.base + "/").read().decode()
         self.assertIn('datalist id="course-catalog"', page)
         self.assertIn('<option value="CS F111">Computer Programming</option>', page)
         self.assertIn('<option value="Computer Programming">CS F111</option>', page)
 
-    def test_staged_documents_produce_course_matches_without_publication(self):
-        profile = StudentProfile("profile", "Pilani", 2025, ("BE-CS",), 3, "2026-T1")
-        staged = {
-            "courses": [{
-                "course_id": "CS F407", "code": "CS F407", "title": "Artificial Intelligence",
-                "evidence_ids": ["EV-1"],
-            }],
-            "evidence": [{
-                "evidence_id": "EV-1", "excerpt": "machine learning and intelligent systems",
-            }],
-        }
-        result = _course_matches_from_staged(profile, "I want AI courses", staged)
-        self.assertEqual(result["recommendations"][0]["course_code"], "CS F407")
-        self.assertEqual(result["recommendations"][0]["badge"], "Course match")
-
-    def test_vague_request_returns_diverse_discovery_not_literal_word_match(self):
-        profile = StudentProfile("profile", "Pilani", 2025, ("BE-CS",), 3, "2026-T1")
-        staged = {
-            "courses": [
-                {"course_id": "ECON F355", "code": "ECON F355", "title": "Business Analysis", "evidence_ids": ["EV-RANDOM"]},
-                {"course_id": "CS F407", "code": "CS F407", "title": "Artificial Intelligence", "evidence_ids": ["EV-AI"]},
-                {"course_id": "GS F232", "code": "GS F232", "title": "Introductory Psychology", "evidence_ids": ["EV-PSY"]},
-                {"course_id": "GS F241", "code": "GS F241", "title": "Creative Writing", "evidence_ids": ["EV-WRITE"]},
-            ],
-            "evidence": [
-                {"evidence_id": "EV-RANDOM", "excerpt": "something in a handout"},
-                {"evidence_id": "EV-AI", "excerpt": "intelligent systems"},
-                {"evidence_id": "EV-PSY", "excerpt": "human behavior"},
-                {"evidence_id": "EV-WRITE", "excerpt": "writing workshop"},
-            ],
-        }
-        result = _course_matches_from_staged(profile, "something interesting", staged)
-        codes = [item["course_code"] for item in result["recommendations"]]
-        self.assertEqual(codes, ["CS F407", "GS F232", "GS F241"])
-        self.assertNotIn("ECON F355", codes)
-
-    def test_admin_role_gate_and_indexed_source_id_path_safety(self):
+    def test_review_page_is_removed_and_indexed_source_paths_are_safe(self):
         admin = self.client()
         self.register(admin, "admin@example.edu")
-        self.assertIn("Source review", admin.open(self.base + "/").read().decode())
+        self.assertNotIn("Source review", admin.open(self.base + "/").read().decode())
 
         student = self.client()
         self.register(student, "student@example.edu")
         with self.assertRaises(HTTPError) as caught:
             student.open(self.base + "/review")
-        self.assertEqual(caught.exception.code, 403)
+        self.assertEqual(caught.exception.code, 404)
         caught.exception.close()
 
         response = admin.open(self.base + "/sources/DOC-test?page=1").read().decode()
@@ -323,32 +336,30 @@ class WorkbenchHTTPTests(unittest.TestCase):
         )
         self.assertEqual(_parse_attempt_text(_profile_attempt_text(profile)), profile.attempts)
 
-    def test_admin_can_verify_one_evidence_page_without_promoting_other_claims(self):
-        review = self.root / "review.json"
-        review.write_text(json.dumps({
-            "status": "needs_review",
+    def test_recommendations_never_fall_back_to_raw_keyword_matching(self):
+        (self.root / "review.json").write_text(json.dumps({
             "snapshot": {
-                "courses": [],
-                "evidence": [
-                    {"evidence_id": "EV-1", "verification_status": "needs_review"},
-                    {"evidence_id": "EV-2", "verification_status": "needs_review"},
-                ],
+                "courses": [{"course_id": "CS F407", "code": "CS F407", "title": "Artificial Intelligence", "evidence_ids": ["EV-1"]}],
+                "offerings": [],
+                "evidence": [{"evidence_id": "EV-1", "excerpt": "Artificial intelligence and machine learning."}],
             },
         }), encoding="utf-8")
-        admin = self.client()
-        self.register(admin, "reviewer@example.edu")
-        csrf = self.csrf(admin.open(self.base + "/").read().decode())
-        response = admin.open(Request(self.base + "/review", data=urlencode({
-            "csrf_token": csrf,
-            "action": "verify_evidence",
-            "evidence_page": "1",
-            "reviewed_id": ["EV-1"],
-            "verified_id": ["EV-1"],
-        }, doseq=True).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"}))
-        self.assertEqual(response.status, 200)
-        saved = json.loads(review.read_text(encoding="utf-8"))
-        statuses = {item["evidence_id"]: item["verification_status"] for item in saved["snapshot"]["evidence"]}
-        self.assertEqual(statuses, {"EV-1": "verified", "EV-2": "needs_review"})
+        guest = self.client()
+        page = guest.open(Request(self.base + "/guest", data=b"", method="POST")).read().decode()
+        csrf = self.csrf(page)
+        guest.open(Request(self.base + "/", data=urlencode({
+            "csrf_token": csrf, "campus": "Pilani", "admission_year": "2025",
+            "primary_programme": "BE-CS", "secondary_programme": "", "minor": "",
+            "current_semester": "2", "target_semester": "2026-T1", "profile_version": "0",
+            "attempts": "", "interests": "",
+        }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})).read()
+        response = guest.open(Request(self.base + "/recommend", data=urlencode({
+            "csrf_token": csrf, "q": "AI courses",
+        }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})).read().decode()
+        self.assertIn("AI recommendations are not configured", response)
+        self.assertNotIn("CS F407 — Artificial Intelligence", response)
+        history = guest.open(self.base + "/history").read().decode()
+        self.assertIn("Your past recommendations will appear here", history)
 
 
 if __name__ == "__main__":

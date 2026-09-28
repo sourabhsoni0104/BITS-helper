@@ -15,11 +15,12 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from recommender.ingestion.corpus import CorpusError, search_corpus  
 from recommender.ingestion.snapshots import SnapshotError, load_snapshot  
 from recommender.models import AttemptStatus, CourseAttempt, StudentProfile  
 from recommender.policies.engine import PolicyResolutionError  
-from recommender.services.recommendation import recommend  
+from recommender.services.academic_agent import AcademicAgent
+from recommender.services.document_chat_agent import DocumentChatAgent
+from recommender.services.groq_client import GroqClient
 from recommender.storage.profiles import ProfileRepository  
 
 
@@ -36,9 +37,22 @@ details{margin-top:10px}.sources{font-size:.78rem;color:#52606d}code{background:
 """
 
 
+def _load_local_environment(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if name and name not in os.environ:
+            os.environ[name] = value.strip().strip("\"'")
+
+
 def page(content: str, synthetic: bool = False) -> bytes:
     banner = '<div class="banner">Synthetic demo — all courses, rules, and evidence below are fictional.</div>' if synthetic else ""
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>BITS Course Recommender</title><style>{CSS}</style></head><body><main class="shell"><div class="meta">EVIDENCE-FIRST ACADEMIC PLANNING</div><h1>Choose with the rules in view.</h1><p class="lede">Academic eligibility is resolved before course preferences. Unknown facts stay visible instead of becoming recommendations.</p>{banner}{content}</main></body></html>""".encode()
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>BITSbuddy</title><style>{CSS}</style></head><body><main class="shell"><div class="meta">BITSBUDDY</div><h1>Choose with the rules in view.</h1><p class="lede">Academic eligibility is resolved before course preferences. Unknown facts stay visible instead of becoming recommendations.</p>{banner}{content}</main></body></html>""".encode()
 
 
 def form(values: dict[str, str]) -> str:
@@ -75,41 +89,34 @@ def render_result(result: dict) -> str:
             checks = "".join(f"<li>{html.escape(check['status'])}: {html.escape(check['explanation'])}</li>" for check in item["eligibility_reasons"])
             sources = ", ".join(item["evidence_references"])
             contribution = item["requirement_contribution"]
-            requirement_line = "No verified requirement contribution" if contribution is None else f"Can contribute to {contribution['requirement_id']} (remaining before selection: {contribution['remaining_before_selection']})"
-            cards += f"""<article class="card"><span class="pill">{html.escape(item['eligibility_status'])} eligible</span><span class="pill">schedule not checked</span><h3>{html.escape(item['course_code'])} — {html.escape(item['title'])}</h3><p>{html.escape(requirement_line)}</p><p>Matches: {html.escape(', '.join(item['matched_topics']) or 'verified academic/category constraints')}</p><details><summary>Eligibility checks</summary><ul>{checks}</ul><p class="sources">Evidence IDs: {html.escape(sources)}</p></details></article>"""
+            requirement_line = "No requirement contribution found" if contribution is None else f"Can contribute to {contribution['requirement_id']} (remaining before selection: {contribution['remaining_before_selection']})"
+            cards += f"""<article class="card"><span class="pill">{html.escape(item['eligibility_status'])} eligible</span><span class="pill">schedule not checked</span><h3>{html.escape(item['course_code'])} — {html.escape(item['title'])}</h3><p>{html.escape(requirement_line)}</p><p>Matches: {html.escape(', '.join(item['matched_topics']) or 'academic and category constraints')}</p><details><summary>Eligibility checks</summary><ul>{checks}</ul><p class="sources">Evidence IDs: {html.escape(sources)}</p></details></article>"""
     else:
-        cards = f'<div class="empty">{html.escape(result["no_result_reason"] or "No verified result.")}</div>'
+        cards = f'<div class="empty">{html.escape(result["no_result_reason"] or "No result found.")}</div>'
         if result["unverified_alternatives"]:
-            cards += "<h3>Unverified alternatives</h3>" + "".join(f'<p>{html.escape(item["course_code"])} — {html.escape(item["reason"])}</p>' for item in result["unverified_alternatives"])
+            cards += "<h3>Other possible matches</h3>" + "".join(f'<p>{html.escape(item["course_code"])} — {html.escape(item["reason"])}</p>' for item in result["unverified_alternatives"])
     return f"""<section><div class="panel"><h2>Academic progress</h2><div class="progress">{progress}</div></div><div class="panel" style="margin-top:20px"><h2>Recommendations</h2><p class="meta">{html.escape(summary)}</p>{cards}</div></section>"""
 
 
-def render_document_search(corpus_path: Path, query: str = "") -> str:
+def render_document_chat(agent: DocumentChatAgent | None, query: str = "") -> str:
     escaped_query = html.escape(query, quote=True)
     form_html = f"""<form method="get" action="/documents">
-    <label>Ask across all supplied PDFs</label>
+    <label>Ask anything</label>
     <textarea name="q" required>{escaped_query}</textarea>
-    <button>Find source passages</button></form>"""
+    <button>Send</button></form>"""
     if not query:
-        content = '<div class="empty">Search regulations, the bulletin, timetable, handouts, FAQs, instructions, and other supplied PDFs.</div>'
+        content = '<div class="empty">Ask about courses, regulations, handouts, timetables, or anything else.</div>'
     else:
         try:
-            result = search_corpus(corpus_path, query)
-            if result["matches"]:
-                content = "".join(
-                    f"""<article class="card"><span class="pill">source text</span>
-                    <h3>{html.escape(item['file_name'])}</h3>
-                    <p class="meta">Page {item['page']} · {html.escape(item['document_type'])}</p>
-                    <p>{html.escape(item['excerpt'])}</p>
-                    <p class="sources">Source: {html.escape(item['source_paths'][0])}</p></article>"""
-                    for item in result["matches"]
-                )
-            else:
-                content = '<div class="empty">No matching source passage was found.</div>'
-            content += f'<p class="meta">{html.escape(result["warning"])}</p>'
-        except CorpusError as exc:
-            content = f'<p class="error">{html.escape(str(exc))}</p>'
-    return f'<section class="panel"><h2>Document library</h2>{form_html}{content}</section>'
+            if agent is None:
+                raise RuntimeError
+            result = agent.answer(query)
+            sources = " · ".join(f'[{item["number"]}] {html.escape(str(item["file_name"]))}' for item in result["citations"])
+            source_html = f'<p class="sources">Sources: {sources}</p>' if sources else ""
+            content = f'<article class="card"><strong>BITSbuddy</strong><p>{html.escape(result["answer"])}</p>{source_html}</article>'
+        except Exception:
+            content = '<p class="error">I couldn’t answer that right now. Please try again.</p>'
+    return f'<section class="panel"><h2>Ask BITSbuddy</h2>{form_html}{content}</section>'
 
 
 def _values_from_profile(profile: StudentProfile, query: str) -> dict[str, str]:
@@ -133,6 +140,9 @@ MAX_FORM_BYTES = 64 * 1024
 
 
 def make_handler(snapshot, profiles: ProfileRepository, corpus_path: Path):
+    groq_client = GroqClient.from_environment()
+    academic_agent = AcademicAgent(groq_client, corpus_path) if groq_client is not None else None
+    document_chat_agent = DocumentChatAgent(groq_client, corpus_path) if groq_client is not None else None
     defaults = {
         "profile_id": "demo-student" if snapshot.synthetic else "",
         "profile_version": "0",
@@ -161,7 +171,7 @@ def make_handler(snapshot, profiles: ProfileRepository, corpus_path: Path):
             query_values = parse_qs(parsed.query)
             if parsed.path == "/documents":
                 query = query_values.get("q", [""])[0].strip()
-                self._send(page(render_document_search(corpus_path, query), snapshot.synthetic))
+                self._send(page(render_document_chat(document_chat_agent, query), snapshot.synthetic))
                 return
             profile_id = query_values.get("profile_id", [""])[0].strip()
             values = defaults
@@ -174,7 +184,7 @@ def make_handler(snapshot, profiles: ProfileRepository, corpus_path: Path):
                 else:
                     values = _values_from_profile(loaded, defaults["query"])
                     notice = f"Loaded profile {profile_id} version {loaded.profile_version}."
-            right = f'<section><div class="empty">{html.escape(notice)}<br><br>Dataset: <code>{html.escape(snapshot.dataset_version)}</code></div><div style="margin-top:20px">{render_document_search(corpus_path)}</div></section>'
+            right = f'<section><div class="empty">{html.escape(notice)}<br><br>Dataset: <code>{html.escape(snapshot.dataset_version)}</code></div><div style="margin-top:20px">{render_document_chat(document_chat_agent)}</div></section>'
             self._send(page(f'<div class="grid">{form(values)}{right}</div>', snapshot.synthetic))
 
         def do_POST(self) -> None:
@@ -259,10 +269,16 @@ def make_handler(snapshot, profiles: ProfileRepository, corpus_path: Path):
                 )
                 saved = profiles.save(profile, expected_version=expected_version)
                 values = _values_from_profile(saved, query)
-                notice = f'<div class="banner" style="background:#e6f6f2;border-color:#83c7b7">Saved profile version {saved.profile_version}.</div>'
+                notice = '<div class="banner" style="background:#e6f6f2;border-color:#83c7b7">Profile saved.</div>'
                 try:
-                    result = recommend(saved, query, snapshot)
-                    output = notice + render_result(result)
+                    if academic_agent is None:
+                        output = notice + '<section class="panel"><p class="error">AI recommendations are not configured. Add a Groq API key and try again.</p></section>'
+                    else:
+                        try:
+                            result = academic_agent.run(saved, query, snapshot)
+                            output = notice + render_result(result)
+                        except Exception:
+                            output = notice + '<section class="panel"><p class="error">The AI recommendation service is temporarily busy. Try again in a moment.</p></section>'
                 except PolicyResolutionError as exc:
                     output = notice + f'<section class="panel"><h2>Profile saved; recommendations unavailable</h2><p class="error">{html.escape(str(exc))}</p></section>'
             except (KeyError, ValueError, PolicyResolutionError) as exc:
@@ -276,6 +292,7 @@ def make_handler(snapshot, profiles: ProfileRepository, corpus_path: Path):
 
 
 def main() -> None:
+    _load_local_environment(ROOT / ".env")
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default=os.getenv("APP_DATA_PATH", "data/processed/active.json"))
     parser.add_argument("--demo", action="store_true", default=os.getenv("DEMO_MODE", "false").casefold() == "true")
@@ -304,6 +321,8 @@ def main() -> None:
         return
     path = ROOT / "data/synthetic/demo_snapshot.json" if args.demo else Path(args.data)
     corpus_path = Path(args.corpus_db)
+    fallback_client = GroqClient.from_environment()
+    fallback_chat_agent = DocumentChatAgent(fallback_client, corpus_path) if fallback_client is not None else None
     profiles = None
     try:
         snapshot = load_snapshot(path)
@@ -315,10 +334,10 @@ def main() -> None:
                 parsed = urlparse(self.path)
                 if parsed.path == "/documents":
                     query = parse_qs(parsed.query).get("q", [""])[0].strip()
-                    body = page(render_document_search(corpus_path, query))
+                    body = page(render_document_chat(fallback_chat_agent, query))
                     status = 200
                 else:
-                    body = page(f'<div class="grid"><div class="empty"><strong>Academic data required</strong><p>{html.escape(message)}</p><p>A runtime student profile and a reviewed normalized snapshot are required for recommendations.</p></div>{render_document_search(corpus_path)}</div>')
+                    body = page(f'<div class="grid"><div class="empty"><strong>Academic data required</strong><p>{html.escape(message)}</p><p>A student profile and structured academic dataset are required for recommendations.</p></div>{render_document_chat(fallback_chat_agent)}</div>')
                     status = 503
                 self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             def log_message(self, format: str, *args) -> None: pass

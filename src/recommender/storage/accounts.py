@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 import threading
@@ -54,6 +55,13 @@ class AccountRepository:
                 created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS account_sessions_user ON account_sessions(user_id);
+            CREATE TABLE IF NOT EXISTS recommendation_history (
+                history_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
+                entry_json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS recommendation_history_user ON recommendation_history(user_id,created_at DESC);
         """)
         
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(accounts)")}
@@ -195,3 +203,37 @@ class AccountRepository:
     def session_for_profile(self, token: str | None, profile_id: str) -> bool:
         session = self.get_session(token)
         return bool(session and session["profile_id"] == profile_id and self.owns_profile(session["user_id"], profile_id))
+
+    def add_recommendation(self, user_id: str, entry: dict[str, Any]) -> None:
+        if not isinstance(user_id, str) or not user_id or not isinstance(entry, dict):
+            raise AccountError("Recommendation history entry is invalid.")
+        payload = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > 128 * 1024:
+            raise AccountError("Recommendation history entry is too large.")
+        with self.lock:
+            if self.connection.execute("SELECT 1 FROM accounts WHERE user_id=?", (user_id,)).fetchone() is None:
+                raise AccountError("Account not found.")
+            self.connection.execute(
+                "INSERT INTO recommendation_history(history_id,user_id,entry_json,created_at) VALUES(?,?,?,?)",
+                (secrets.token_urlsafe(18), user_id, payload, time.time()),
+            )
+            self.connection.execute(
+                "DELETE FROM recommendation_history WHERE user_id=? AND history_id NOT IN "
+                "(SELECT history_id FROM recommendation_history WHERE user_id=? ORDER BY created_at DESC LIMIT 50)",
+                (user_id, user_id),
+            )
+            self.connection.commit()
+
+    def recommendation_history(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 50))
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT history_id,entry_json,created_at FROM recommendation_history WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [{"history_id": row["history_id"], "created_at": row["created_at"], **json.loads(row["entry_json"])} for row in rows]
+
+    def clear_recommendation_history(self, user_id: str) -> None:
+        with self.lock:
+            self.connection.execute("DELETE FROM recommendation_history WHERE user_id=?", (user_id,))
+            self.connection.commit()

@@ -18,15 +18,14 @@ The original problem statement is included in the repository as `postman_25_r2.p
 6. [Configuration](#configuration)
 7. [Running the app](#running-the-app)
 8. [Using the web app](#using-the-web-app)
-9. [Command line reference](#command-line-reference)
-10. [Data pipeline: from documents to recommendations](#data-pipeline-from-documents-to-recommendations)
-11. [The data model](#the-data-model)
-12. [The policy engine](#the-policy-engine)
-13. [AI features](#ai-features)
-14. [Privacy and security](#privacy-and-security)
-15. [Testing](#testing)
-16. [Design decisions](#design-decisions)
-17. [Known limitations](#known-limitations)
+9. [Data pipeline: from documents to recommendations](#data-pipeline-from-documents-to-recommendations)
+10. [The data model](#the-data-model)
+11. [The policy engine](#the-policy-engine)
+12. [AI features](#ai-features)
+13. [Privacy and security](#privacy-and-security)
+14. [Testing](#testing)
+15. [Design decisions](#design-decisions)
+16. [Known limitations](#known-limitations)
 
 ---
 

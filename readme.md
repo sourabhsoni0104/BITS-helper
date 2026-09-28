@@ -1,0 +1,491 @@
+# BITSbuddy: BITS Academic Course Recommender
+
+BITSbuddy is a local-first academic workbench for BITS Pilani students. It helps a student choose courses for a semester by working out what they are required and eligible to take first, and only then matching courses to their interests and natural-language preferences.
+
+The project is built around one rule: **academic rules are checked deterministically, and language models are only used for understanding the question and explaining the answer.** Nothing is recommended just because a course description sounds relevant. If a fact cannot be found in the supplied documents, the app says it could not be verified instead of guessing.
+
+The original problem statement is included in the repository as `postman_25_r2.pdf`.
+
+---
+
+## Table of contents
+
+1. [What it does](#what-it-does)
+2. [How it works](#how-it-works)
+3. [Repository layout](#repository-layout)
+4. [Requirements](#requirements)
+5. [Setup](#setup)
+6. [Configuration](#configuration)
+7. [Running the app](#running-the-app)
+8. [Using the web app](#using-the-web-app)
+9. [Command line reference](#command-line-reference)
+10. [Data pipeline: from documents to recommendations](#data-pipeline-from-documents-to-recommendations)
+11. [The data model](#the-data-model)
+12. [The policy engine](#the-policy-engine)
+13. [AI features](#ai-features)
+14. [Privacy and security](#privacy-and-security)
+15. [Testing](#testing)
+16. [Design decisions](#design-decisions)
+17. [Known limitations](#known-limitations)
+
+---
+
+## What it does
+
+- **Student profiles.** A student records campus, admission year, programme or dual degree, current semester, completed and current courses, an optional minor, and academic interests.
+- **Transcript import.** A BITS performance sheet PDF can be uploaded. The app extracts the student's metadata and full course history, then shows it for review before anything is saved.
+- **Requirement analysis.** The engine computes remaining requirements across the CDC, DEL, HUEL and OPEL categories, including programme and minor rules, shared credit, aliases, and repeated courses.
+- **Eligibility checks.** Prerequisites, restrictions, and already-taken courses are applied before any preference matching happens.
+- **Natural-language queries.** Students can ask things like:
+  - "Suggest DELs related to AI."
+  - "I want an OPEL with no attendance requirement."
+  - "Suggest courses with no midsem and a lenient makeup policy."
+  - "I need a HUEL and prefer project-based evaluation."
+- **Handout-aware preferences.** Attendance rules, midsem and compre presence, projects, quizzes, and makeup policy are read from course handouts and used as constraints.
+- **Timetable checks.** Class meeting conflicts are detected per term. When times or sections are unresolved, the result is reported as unknown rather than as a made-up clash.
+- **Cited document chat.** Any question about regulations, the bulletin, timetables, or handouts can be answered from the full indexed library, with numbered citations that link to the exact page or section.
+- **Source review gate.** Facts extracted from documents start as `needs_review` and only become usable after explicit verification and publication.
+
+---
+
+## How it works
+
+```
+Student profile + question
+          |
+          v
+Academic requirement analysis     (deterministic)
+          |
+          v
+Remaining CDC / DEL / HUEL / OPEL (deterministic)
+          |
+          v
+Eligible course set               (deterministic)
+          |
+          v
+Preference matching               (handout facts, topics, optional LLM intent parsing)
+          |
+          v
+Policy and schedule validation    (deterministic)
+          |
+          v
+Final recommendations with evidence
+```
+
+Three ideas hold the system together:
+
+1. **Structured data over raw text.** Source PDFs are pre-processed into a normalized snapshot of courses, offerings, policies, and requirements. The recommender reads the snapshot, not raw PDFs.
+2. **Evidence for every claim.** Each verified fact points to a registered source document and a supporting excerpt. Recommendation cards show the evidence behind them.
+3. **Unknown stays unknown.** Missing, conflicting, or unverified facts produce an `unknown` result, never an optimistic pass.
+
+---
+
+## Repository layout
+
+```
+BITS-helper/
+|-- app/
+|   |-- dashboard.py            Entry point. Starts the HTTP server.
+|   `-- workbench.py            The full web app: sessions, profiles, import, chat, history.
+|-- src/recommender/
+|   |-- models.py               Dataclasses and enums for the whole domain.
+|   |-- query.py                Deterministic natural-language query parser.
+|   |-- cli.py                  The bits-recommender command line tool.
+|   |-- ingestion/
+|   |   |-- documents.py        PDF and DOCX text extraction, OCR fallback, source inventory.
+|   |   |-- corpus.py           Incremental SQLite full-text search index of all documents.
+|   |   |-- handouts.py         Resumable downloader for course handout PDFs.
+|   |   |-- marksheets.py       Performance sheet parser.
+|   |   |-- review.py           Builds and publishes the review bundle.
+|   |   `-- snapshots.py        Snapshot loading, validation, and atomic publication.
+|   |-- policies/
+|   |   `-- engine.py           Requirement allocation and eligibility evaluation.
+|   |-- services/
+|   |   |-- recommendation.py       Turns an intent plus a profile into ranked recommendations.
+|   |   |-- academic_agent.py       LLM-assisted recommendation planning over a verified snapshot.
+|   |   |-- staged_discovery_agent.py  LLM-assisted discovery over the unverified staged bundle.
+|   |   |-- course_discovery.py     Keyword and topic based course discovery.
+|   |   |-- document_answers.py     Extractive cited answers.
+|   |   |-- document_chat_agent.py  Conversational cited answers over the corpus.
+|   |   |-- scheduling.py           Meeting conflict detection.
+|   |   |-- marksheet_import.py     Preview and confirm flow for uploaded transcripts.
+|   |   `-- groq_client.py          Minimal client for the Groq chat completions API.
+|   `-- storage/
+|       |-- profiles.py         SQLite profile storage with optimistic versioning.
+|       `-- accounts.py         Optional local accounts and sessions.
+|-- tests/unit/                 Unit and regression tests.
+|-- docs/
+|   |-- decisions.md            Dated engineering decision log.
+|   `-- codebase-review.md      Snapshot of coverage and implemented corrections.
+|-- postman_25_r2.pdf           The original problem statement.
+|-- pyproject.toml              Package metadata and the bits-recommender script.
+|-- .env.example                Template for configuration.
+`-- .gitignore
+```
+
+Runtime data lives under a `data/` directory that you create locally. It is deliberately ignored by Git (see [Privacy and security](#privacy-and-security)).
+
+---
+
+## Requirements
+
+**Python:** 3.11 or newer.
+
+**Python packages:** none. The project uses only the standard library, so there is nothing to `pip install` beyond the project itself.
+
+**System tools:**
+
+| Tool | Needed for | Required? |
+| --- | --- | --- |
+| `pdftotext` and `pdfinfo` (Poppler) | Extracting text from PDFs, validating downloaded handouts | Yes, for any PDF ingestion |
+| `pdftoppm` (Poppler) and `tesseract` | OCR of PDF pages that have no text layer | Optional, but without them scanned pages stay unsearchable |
+
+Install them with your package manager:
+
+```bash
+# macOS
+brew install poppler tesseract
+
+# Debian or Ubuntu
+sudo apt install poppler-utils tesseract-ocr
+```
+
+**Optional service:** a [Groq](https://groq.com) API key enables the AI recommendation and chat features. Without a key, the deterministic pieces (document indexing, cited extractive search, marksheet parsing, snapshot validation) still work, but the natural-language recommendation and chat pages report that AI is not configured.
+
+---
+
+## Setup
+
+```bash
+# 1. Get the code
+git clone <your-repository-url> BITS-helper
+cd BITS-helper
+
+# 2. Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. Install the package (this provides the bits-recommender command)
+pip install -e .
+
+# 4. Create your local configuration
+cp .env.example .env
+# then edit .env and set GROQ_API_KEY if you want AI features
+
+# 5. Create the data folders
+mkdir -p data/raw data/processed data/reports data/extracted
+```
+
+Then place your source documents (regulations, bulletin, timetable, handouts, and any other reference PDFs or DOCX files) under `data/raw/`.
+
+---
+
+## Configuration
+
+Configuration is read from environment variables. `app/dashboard.py` also loads a `.env` file from the project root at startup, without overriding variables that are already set in your shell.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_DATA_PATH` | `data/processed/active.json` | The published, validated academic snapshot. |
+| `APP_PROFILE_DB` | `data/processed/profiles.sqlite` | Saved profiles for signed-in accounts. |
+| `APP_ACCOUNT_DB` | `data/processed/accounts.sqlite` | Optional local accounts and sessions. |
+| `APP_CORPUS_DB` | `data/processed/document-corpus.sqlite` | The full-text index of all reference documents. |
+| `APP_REVIEW_PATH` | `data/processed/review-bundle.json` | The staged, not-yet-verified candidate bundle. |
+| `APP_HANDOUT_INDEX` | `data/raw/All Courses Handouts.html` | The saved handout listing page. |
+| `DEMO_MODE` | `false` | Runs the fictional demo dataset instead of real data. |
+| `APP_HOST` | `127.0.0.1` | Interface the server binds to. |
+| `APP_PORT` | `8501` | Port the server listens on. |
+| `GROQ_API_KEY` | empty | Enables AI features when set. |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | Model used through the Groq API. |
+| `GROQ_API_URL` | Groq chat completions URL | Override only for a compatible endpoint. |
+
+Every path setting can also be passed as a command line flag to the app (see below).
+
+---
+
+## Running the app
+
+```bash
+python app/dashboard.py
+```
+
+Then open `http://127.0.0.1:8501`.
+
+Available flags:
+
+```
+--data PATH           Published snapshot (default: data/processed/active.json)
+--corpus-db PATH      Document index database
+--profile-db PATH     Profile database
+--account-db PATH     Account database
+--review PATH         Review bundle
+--handout-index PATH  Saved handout index HTML
+--host HOST           Bind address
+--port PORT           Port
+--demo                Use the synthetic demo snapshot
+```
+
+### Real-data mode (default)
+
+Starts the full workbench with guest sessions, optional accounts, transcript import, recommendations, history, and document chat.
+
+The app works in stages depending on which data exists:
+
+| State of your data | What the recommendations page does |
+| --- | --- |
+| A published `active.json` exists | Recommendations run against the verified snapshot. |
+| Only `review-bundle.json` exists | Recommendations run against the staged, unverified candidates. |
+| Neither exists | The page asks you to index or upload course documents first. |
+
+### Demo mode
+
+`--demo` (or `DEMO_MODE=true`) runs against a fictional snapshot at `data/synthetic/demo_snapshot.json` and shows a banner stating that all courses, rules, and evidence are fictional. Real-data mode never falls back to it. Note that this fixture file is not part of this repository copy, so you need to supply it to use demo mode.
+
+---
+
+## Using the web app
+
+The navigation bar has five pages.
+
+**Sign in.** Choose *Continue as guest* to use the app with no account, or create an optional account to save your profile between visits. The first account created on an installation becomes the local administrator.
+
+**Profile.** Fill in your campus, admission year, programme, minor, current semester, and interests. Programmes, minors, campuses, and terms are picked from labelled selectors, and course history is edited as add and remove rows. Internal identifiers are never shown.
+
+**Recommendations.** Describe what you want in plain English. The response lists courses with the requirement they satisfy, eligibility status, relevant course properties, and evidence links. Each search can be saved to history.
+
+**History.** Past recommendation searches for this session or account, with the option to clear them.
+
+**Upload transcript.** Upload a BITS performance sheet PDF (up to 10 MB). The app pre-fills student metadata and the past and current course history, decoding admission year, branch, and campus from the student ID. You review and confirm the rows before anything is saved. Unknown course codes are left unselected, and letter grades never imply pass or fail on their own.
+
+**Chat.** Ask any question about regulations, the bulletin, timetables, or handouts. Answers cite numbered sources, and each citation links to the exact page or DOCX section of the source document.
+
+---
+
+## Command line reference
+
+Installing the package provides the `bits-recommender` command. You can also run `python -m recommender.cli` with `PYTHONPATH=src`.
+
+| Command | Purpose |
+| --- | --- |
+| `inventory` | Scan `data/raw` and report candidate source files without trusting filenames. |
+| `extract` | Extract page-aware text from one confirmed source document. |
+| `download-handouts` | Download handout PDFs listed in a saved index page. |
+| `build-corpus` | Incrementally index all PDF and DOCX documents into the search database. |
+| `search-docs` | Retrieve cited pages from the index. |
+| `answer-docs` | Produce an extractive answer from cited passages. |
+| `prepare-review` | Extract source-linked candidates into a review bundle. |
+| `publish-review` | Validate and publish an explicitly reviewed bundle as the active snapshot. |
+| `parse-marksheet` | Extract reviewable course attempts from a performance sheet. |
+| `ingest` | Validate and atomically publish a normalized JSON snapshot. |
+| `validate` | Validate a snapshot and print any issues. |
+| `status` | Show a summary of the active dataset. |
+
+Examples:
+
+```bash
+# See what is in the raw data folder
+bits-recommender inventory --input data/raw
+
+# Build the searchable index of every PDF and DOCX under data/
+bits-recommender build-corpus --input data --output data/processed/document-corpus.sqlite
+
+# Ask a cited question from the command line
+bits-recommender answer-docs --query "What is the attendance requirement for makeup exams?"
+
+# Filter searches by document type or semester
+bits-recommender search-docs --query "machine learning" --type handout --limit 5
+
+# Stage candidates for review
+bits-recommender prepare-review --campus Pilani --semester 2026-T1 --admission-year 2025
+
+# Publish only after human verification
+bits-recommender publish-review --reviewer "Your Name"
+
+# Check the published data
+bits-recommender status
+bits-recommender validate
+```
+
+Commands print JSON. Errors exit with status code 2 and a readable message.
+
+---
+
+## Data pipeline: from documents to recommendations
+
+The pipeline is split into extraction and trust so that nothing unverified can drive a recommendation silently.
+
+### 1. Collect sources
+
+Place PDF and DOCX reference documents under `data/raw/`. This includes regulations, the bulletin, the timetable, and handouts.
+
+To fetch handouts in bulk, sign in to the BITS academic portal in your browser, open the *All Courses Handouts* page, and save it as HTML to `data/raw/All Courses Handouts.html`. Then run:
+
+```bash
+bits-recommender download-handouts \
+  --index "data/raw/All Courses Handouts.html" \
+  --output data/raw/handouts
+```
+
+The downloader:
+
+- never sees or stores your credentials or cookies, since it only reads the saved page;
+- allows only HTTPS links on the expected BITS academic host and handout path, including across redirects;
+- validates each download as a real PDF;
+- records hashes in a manifest at `data/reports/handout-downloads.json`;
+- resumes safely if interrupted, so you can rerun it to retry failures;
+- supports `--dry-run`, `--limit`, `--delay`, and `--timeout`.
+
+### 2. Index the library
+
+```bash
+bits-recommender build-corpus --input data
+```
+
+This extracts text page by page (PDFs) or by logical section (DOCX), falls back to OCR for empty pages when `pdftoppm` and `tesseract` are installed, and stores everything in a SQLite full-text search database. Indexing is incremental and based on content hashes, and duplicate source paths are preserved rather than dropped.
+
+Some files are deliberately excluded from the shared index:
+
+- Personal performance sheets and transcripts, so one student's records never appear as general reference material.
+- The category-wise academic structure report, which is outside the product scope.
+
+### 3. Stage candidates
+
+```bash
+bits-recommender prepare-review
+```
+
+This creates `data/processed/review-bundle.json` containing candidate courses, offerings, and evidence records extracted from the indexed documents. Every extracted claim starts as `needs_review`. Nothing in this bundle counts as verified.
+
+### 4. Verify and publish
+
+Review each candidate against the indexed source page, mark supported evidence as verified, and then publish:
+
+```bash
+bits-recommender publish-review --reviewer "Your Name"
+```
+
+Publication includes only evidence-supported records, validates the whole snapshot, archives the previous `active.json`, and replaces it atomically. Snapshot validation rejects any verified course, offering, availability, category membership, handout fact, policy context, or requirement that does not cite at least one verified evidence record, where that evidence resolves to a registered document and contains a supporting excerpt.
+
+You can also validate and publish a hand-built normalized snapshot directly with `bits-recommender ingest --input candidate.json`.
+
+### 5. Recommend
+
+The web app loads the active snapshot, resolves the student's policy context, and runs the recommendation flow shown in [How it works](#how-it-works).
+
+---
+
+## The data model
+
+The main types live in `src/recommender/models.py`.
+
+| Concept | Description |
+| --- | --- |
+| `Evidence` | A supporting excerpt tied to a document and a page or section, with a verification status. |
+| `Course` | Course id, code, title, units, topics, and evidence ids. |
+| `Fact` | A value plus a verification status and evidence ids. Used for handout properties such as attendance or midsem. |
+| `Offering` | A course offered in a term, with section and schedule information. |
+| `PolicyContext` | The set of rules that apply to a campus, programme, and batch. |
+| `StudentProfile` | Campus, admission year, programme, minor, semester, interests, and course attempts. |
+| `CourseAttempt` | One attempt at one course, with its own attempt id, term, and status. |
+| `DatasetSnapshot` | The complete normalized, validated dataset the engine reads. |
+
+Enums:
+
+- `VerificationStatus`: `verified`, `needs_review`, `not_found`, `conflicting`.
+- `DecisionStatus`: `pass`, `fail`, `unknown`.
+- `AttemptStatus`: `completed`, `in_progress`, `failed`, `withdrawn`.
+
+**Attempts are events, not flags.** A course is stored as a series of attempts with term ids and chronological order. This preserves retakes and lets an evidence-backed repeat policy choose the latest result.
+
+---
+
+## The policy engine
+
+`src/recommender/policies/engine.py` holds the deterministic academic logic.
+
+- **Policy resolution.** Picks the policy context for a student's campus, programme, and batch, and resolves a separate context for a minor.
+- **Requirement allocation.** Assigns completed courses to requirements using a bounded, memoized state search rather than exhaustive enumeration.
+- **Credit accounting.** Programme and minor requirements use one allocation. Aliases count credit once. Repeated courses follow an explicit latest-attempt policy. Shared credit across requirements applies only when every requirement opts in.
+- **Eligibility.** Current and completed courses are excluded. Prerequisite equivalences require verified evidence. Missing or conflicting facts produce `unknown`.
+- **Expressions.** Prerequisites and requirements are structured expressions evaluated against the profile.
+
+`src/recommender/services/scheduling.py` handles timetable checks. Conflicts are detected only within the applicable term. If times are absent or the chosen alternative section is ambiguous, the answer is `unknown`, not a conflict manufactured by merging all sections.
+
+`src/recommender/query.py` is a bounded, deterministic parser that reads categories (CDC, DEL, HUEL, OPEL), topics, and constraints such as "no midsem", "no attendance requirement", and project-based evaluation. It handles negation ("not a DEL") by asking a clarifying question instead of guessing.
+
+---
+
+## AI features
+
+AI is optional and is confined to roles that do not decide academic validity.
+
+- **Intent understanding.** Turning a free-form request into structured preferences and constraints.
+- **Semantic matching and explanation.** Finding relevant courses and explaining why each fits.
+- **Conversational document answers.** Writing readable answers that cite the retrieved passages.
+
+The model is called through the Groq chat completions API using function calling with tightly defined tool schemas, a low temperature, and a capped response length. Retrieved passages are treated as untrusted data, and the prompts tell the model to ignore instructions found inside them and to say what could not be found instead of guessing.
+
+The model never bypasses the policy engine. Its plan is passed through the same deterministic recommendation and validation code, and a final validation step checks the result.
+
+Document retrieval labels passages as `source_text_only`. General retrieval cannot create verified academic rules or skip the normalized snapshot that the eligibility engine uses.
+
+---
+
+## Privacy and security
+
+BITSbuddy is designed for local use. This is a localhost deployment model and not a claim of production internet hardening.
+
+**Guest sessions**
+- Guest profiles, pending transcript imports, chat threads, and recommendation history live in memory only.
+- They are deleted when the guest chooses *Forget this session*, when the session expires (two hours), or when the server restarts.
+
+**Optional accounts**
+- Passwords are salted and stretched with PBKDF2 (310,000 iterations).
+- Sessions are stored by token hash, and cookies are `HttpOnly` and `SameSite=Lax`.
+- Each account is bound to one opaque profile id on the server, and profile ownership is checked on every access.
+- Form mutations are protected by CSRF tokens.
+
+**Uploads**
+- Transcript uploads are size-limited, held in an expiring in-memory review (20 minutes), and saved only after the student confirms.
+
+**Credentials and personal data**
+- The application never stores BITS portal credentials or cookies.
+- Personal marksheets, transcripts, and performance sheets, the generated databases, and `.env` are all excluded by `.gitignore`.
+
+Keep `.env` out of version control. It holds your API key.
+
+---
+
+## Testing
+
+The test suite uses the standard library `unittest`, and it works with `pytest` too.
+
+```bash
+# From the project root
+PYTHONPATH=src:. python -m unittest discover -s tests -t .
+
+# or, if you use pytest
+PYTHONPATH=src:. pytest tests
+```
+
+Coverage areas include the policy engine, recommendation regressions, query parsing, scheduling, profiles and accounts, marksheet import, document extraction and corpus indexing, review and publication, handout downloads, the Groq client, and the web app.
+
+Some tests read the fictional demo snapshot at `data/synthetic/demo_snapshot.json`. That file is not included in this repository copy, so those tests will error until you add it.
+
+---
+
+## Design decisions
+
+The full dated log is in [`docs/decisions.md`](docs/decisions.md). The main choices are:
+
+- **Standard library only.** No package downloads are needed to run the engine, the tests, the CLI, or the web app, which keeps the deterministic boundary obvious.
+- **Two trust lanes for documents.** Reference documents are searchable with citations, but only the verified snapshot can drive eligibility decisions.
+- **Extraction and publication are separate steps.** Extracted claims are always `needs_review` until a human verifies them.
+- **Verified claims require evidence.** Publication rejects anything verified that lacks a usable, resolvable evidence record.
+- **Conservative scheduling.** Unresolved times, terms, or sections yield `unknown`.
+- **Extractive cited answers.** Document answers are complete passages with exact page or section links. They do not synthesize new academic rules.
+- **Profiles are runtime input.** Student data is not part of a static corpus, and profile-like documents are kept out of shared search.
+
+[`docs/codebase-review.md`](docs/codebase-review.md) records coverage numbers and the corrections that were implemented.
+
+---

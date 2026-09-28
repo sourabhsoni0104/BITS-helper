@@ -319,12 +319,15 @@ def evaluate_eligibility(profile: StudentProfile, offering: Offering, requested_
     )
     if requested_category:
         memberships = [membership for membership in offering.categories if membership.category == requested_category]
+        applicable_memberships = [
+            membership for membership in memberships
+            if membership.verification_status == VerificationStatus.VERIFIED
+            and (not membership.programme_ids or bool(set(membership.programme_ids) & set(profile.programme_ids)))
+        ]
         if requested_category in applicable_categories:
-            evidence = next(
-                membership.evidence_ids for membership in memberships
-                if membership.verification_status == VerificationStatus.VERIFIED
-                and (not membership.programme_ids or bool(set(membership.programme_ids) & set(profile.programme_ids)))
-            )
+            
+            
+            evidence = applicable_memberships[0].evidence_ids if applicable_memberships else ()
             checks.append(CheckResult("category", DecisionStatus.PASS, "CATEGORY_APPLICABLE", f"Listed as {requested_category} for this programme context.", evidence))
         elif memberships:
             checks.append(CheckResult("category", DecisionStatus.UNKNOWN, "CATEGORY_UNVERIFIED", f"The supplied rules do not confirm {requested_category} membership for this programme context."))

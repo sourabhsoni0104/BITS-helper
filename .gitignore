@@ -1,20 +1,6 @@
-__pycache__/
-*.py[cod]
-.venv/
 .env
-.DS_Store
-.pytest_cache/
-tmp/
 data/processed/*
 !data/processed/.gitkeep
-data/extracted/*
-!data/extracted/.gitkeep
-data/reports/*
-!data/reports/.gitkeep
-data/raw/BIT_PERFMNC1.pdf
-data/raw/BIT_ACAD_RPT.pdf
-data/raw/*[Tt]ranscript*
-data/raw/*[Mm]arksheet*
-data/raw/*[Pp]erformance*[Ss]heet*
-data/raw/All Courses Handouts_files/
-data/raw/dataset.zip
+.pytest_cache/
+*.egg-info/
+.DS_Store

@@ -109,8 +109,10 @@ def _is_allowed_handout_url(url: str) -> bool:
             return False
         segments = decoded_path.split("/")
         return (
-            parsed.path.startswith(HANDOUT_PATH_PREFIX)
-            and decoded_path.startswith(HANDOUT_PATH_PREFIX)
+            
+            
+            parsed.path.casefold().startswith(HANDOUT_PATH_PREFIX.casefold())
+            and decoded_path.casefold().startswith(HANDOUT_PATH_PREFIX.casefold())
             and decoded_path.casefold().endswith(".pdf")
             and "\\" not in decoded_path
             and not any(segment in {".", ".."} for segment in segments)

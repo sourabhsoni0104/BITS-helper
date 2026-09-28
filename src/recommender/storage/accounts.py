@@ -14,6 +14,9 @@ from typing import Any
 
 PASSWORD_ITERATIONS = 310_000
 DEFAULT_SESSION_SECONDS = 60 * 60 * 24 * 14
+MAX_FAILED_LOGINS = 5
+LOGIN_LOCKOUT_SECONDS = 15 * 60
+SESSION_SWEEP_SECONDS = 300.0
 
 
 class AccountError(ValueError):
@@ -22,6 +25,14 @@ class AccountError(ValueError):
 
 class AccountExistsError(AccountError):
     pass
+
+
+class AccountLockedError(AccountError):
+    """Too many failed login attempts; the caller must wait before retrying."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("Too many failed login attempts. Try again later.")
+        self.retry_after = max(1.0, float(retry_after))
 
 
 class AccountRepository:
@@ -50,11 +61,16 @@ class AccountRepository:
                 token_hash TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
                 csrf_hash TEXT NOT NULL,
-                csrf_token TEXT NOT NULL,
                 expires_at REAL NOT NULL,
                 created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS account_sessions_user ON account_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS account_sessions_expires ON account_sessions(expires_at);
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                email TEXT PRIMARY KEY,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                locked_until REAL NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS recommendation_history (
                 history_id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,
@@ -63,13 +79,30 @@ class AccountRepository:
             );
             CREATE INDEX IF NOT EXISTS recommendation_history_user ON recommendation_history(user_id,created_at DESC);
         """)
-        
+
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(accounts)")}
         if "role" not in columns:
             self.connection.execute("ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'student'")
+        
+        
+        
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(account_sessions)")}
-        if "csrf_token" not in columns:
-            self.connection.execute("ALTER TABLE account_sessions ADD COLUMN csrf_token TEXT NOT NULL DEFAULT ''")
+        if "csrf_token" in columns:
+            self.connection.execute(
+                "CREATE TABLE account_sessions_clean ("
+                "token_hash TEXT PRIMARY KEY,"
+                "user_id TEXT NOT NULL REFERENCES accounts(user_id) ON DELETE CASCADE,"
+                "csrf_hash TEXT NOT NULL,"
+                "expires_at REAL NOT NULL,"
+                "created_at REAL NOT NULL)"
+            )
+            self.connection.execute(
+                "INSERT INTO account_sessions_clean(token_hash,user_id,csrf_hash,expires_at,created_at) "
+                "SELECT token_hash,user_id,csrf_hash,expires_at,created_at FROM account_sessions"
+            )
+            self.connection.execute("DROP TABLE account_sessions")
+            self.connection.execute("ALTER TABLE account_sessions_clean RENAME TO account_sessions")
+        self._last_sweep = 0.0
         self.connection.commit()
 
     def close(self) -> None:
@@ -98,6 +131,42 @@ class AccountRepository:
     def _token_hash(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+    def _sweep_expired(self, now: float) -> None:
+        """Periodically purge expired sessions so they do not accumulate forever.
+
+        Callers must already hold self.lock. Throttled to once per SESSION_SWEEP_SECONDS.
+        """
+        if now - self._last_sweep < SESSION_SWEEP_SECONDS:
+            return
+        self._last_sweep = now
+        self.connection.execute("DELETE FROM account_sessions WHERE expires_at <= ?", (now,))
+        self.connection.execute("DELETE FROM login_attempts WHERE locked_until > 0 AND locked_until <= ?", (now,))
+        self.connection.commit()
+
+    def _check_lockout(self, normalized: str, now: float) -> None:
+        row = self.connection.execute(
+            "SELECT failed_count,locked_until FROM login_attempts WHERE email=?", (normalized,)
+        ).fetchone()
+        if row is not None and float(row["locked_until"]) > now:
+            raise AccountLockedError(float(row["locked_until"]) - now)
+
+    def _record_failed_login(self, normalized: str, now: float) -> None:
+        row = self.connection.execute(
+            "SELECT failed_count FROM login_attempts WHERE email=?", (normalized,)
+        ).fetchone()
+        failed = (int(row["failed_count"]) if row else 0) + 1
+        locked_until = now + LOGIN_LOCKOUT_SECONDS if failed >= MAX_FAILED_LOGINS else 0.0
+        self.connection.execute(
+            "INSERT INTO login_attempts(email,failed_count,locked_until) VALUES(?,?,?) "
+            "ON CONFLICT(email) DO UPDATE SET failed_count=?, locked_until=?",
+            (normalized, failed, locked_until, failed, locked_until),
+        )
+        self.connection.commit()
+
+    def _clear_failed_logins(self, normalized: str) -> None:
+        self.connection.execute("DELETE FROM login_attempts WHERE email=?", (normalized,))
+        self.connection.commit()
+
     def register(self, email: str, password: str) -> tuple[str, str]:
         normalized = self._email(email)
         secret = self._password_bytes(password)
@@ -125,22 +194,32 @@ class AccountRepository:
     def login(self, email: str, password: str) -> tuple[str, dict[str, Any]]:
         normalized = self._email(email)
         secret = self._password_bytes(password)
+        now = time.time()
         with self.lock:
+            self._sweep_expired(now)
+            
+            
+            self._check_lockout(normalized, now)
             row = self.connection.execute("SELECT * FROM accounts WHERE email = ?", (normalized,)).fetchone()
         if row is None:
             
             hashlib.pbkdf2_hmac("sha256", secret, b"account-login-dummy-salt", PASSWORD_ITERATIONS)
+            with self.lock:
+                self._record_failed_login(normalized, time.time())
             raise AccountError("Email or password is incorrect.")
         actual = hashlib.pbkdf2_hmac("sha256", secret, row["password_salt"], PASSWORD_ITERATIONS)
         if not hmac.compare_digest(actual, row["password_hash"]):
+            with self.lock:
+                self._record_failed_login(normalized, time.time())
             raise AccountError("Email or password is incorrect.")
         token = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(24)
         expires_at = time.time() + self.session_seconds
         with self.lock:
+            self._clear_failed_logins(normalized)
             self.connection.execute(
-                "INSERT INTO account_sessions(token_hash,user_id,csrf_hash,csrf_token,expires_at,created_at) VALUES(?,?,?,?,?,?)",
-                (self._token_hash(token), row["user_id"], self._token_hash(csrf_token), csrf_token, expires_at, time.time()),
+                "INSERT INTO account_sessions(token_hash,user_id,csrf_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
+                (self._token_hash(token), row["user_id"], self._token_hash(csrf_token), expires_at, time.time()),
             )
             self.connection.commit()
         return token, {
@@ -157,8 +236,9 @@ class AccountRepository:
         token_hash = self._token_hash(token)
         now = time.time()
         with self.lock:
+            self._sweep_expired(now)
             row = self.connection.execute(
-                "SELECT a.user_id,a.profile_id,a.role,s.csrf_token,s.csrf_hash,s.expires_at FROM account_sessions s "
+                "SELECT a.user_id,a.profile_id,a.role,s.expires_at FROM account_sessions s "
                 "JOIN accounts a ON a.user_id=s.user_id WHERE s.token_hash=?",
                 (token_hash,),
             ).fetchone()
@@ -170,7 +250,7 @@ class AccountRepository:
             return None
         return {
             "user_id": row["user_id"], "profile_id": row["profile_id"], "role": row["role"],
-            "csrf_token": row["csrf_token"], "expires_at": row["expires_at"],
+            "expires_at": row["expires_at"],
         }
 
     def verify_csrf(self, token: str | None, csrf_token: str | None) -> bool:

@@ -15,7 +15,10 @@ def parse_query(query: str) -> QueryIntent:
         item for item in KNOWN_CATEGORIES
         if re.search(rf"\b{item.casefold()}s?\b", lowered)
     }
-    category = next(iter(category_matches)) if len(category_matches) == 1 else None
+    
+    
+    ordered_matches = [item for item in KNOWN_CATEGORIES if item in category_matches]
+    category = ordered_matches[0] if len(ordered_matches) == 1 else None
     topics: list[str] = []
     topic_match = re.search(r"\b(ai|artificial intelligence|machine learning|ml)\b", lowered)
     hard: list[Constraint] = []
@@ -44,8 +47,6 @@ def parse_query(query: str) -> QueryIntent:
         else:
             topics.append("artificial intelligence")
 
-    
-    
     project_match = re.search(r"\bproject(?:s|[- ]based)?\b", lowered)
     if project_match:
         project_mentions = list(re.finditer(r"\bproject(?:s|[- ]based)?\b", lowered))

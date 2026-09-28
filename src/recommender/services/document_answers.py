@@ -78,6 +78,10 @@ def answer_question(
             })
     candidates.sort(key=lambda item: (-item["_overlap"], -item["_rank"], item["file_name"], item["page"] or 0))
     citations = [{key: value for key, value in item.items() if not key.startswith("_")} for item in candidates[:limit]]
+    
+    
+    for index, citation in enumerate(citations, start=1):
+        citation["number"] = index
     if not citations:
         return {
             "question": question,

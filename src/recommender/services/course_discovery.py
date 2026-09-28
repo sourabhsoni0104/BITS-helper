@@ -194,7 +194,7 @@ def discover_courses(
     for _, prefix, _, identity, card in ordered:
         if identity in seen_identities:
             continue
-        if not search_terms and prefix_counts[prefix] >= 2:
+        if prefix_counts[prefix] >= 2:
             continue
         recommendations.append(card)
         seen_identities.add(identity)

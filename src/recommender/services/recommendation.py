@@ -27,6 +27,14 @@ def _topic_score(topics: tuple[str, ...], preferences: tuple[str, ...]) -> int:
     return sum(any(matches(alias) for alias in aliases.get(preference.casefold(), (preference,))) for preference in preferences)
 
 
+class FinalValidationError(RuntimeError):
+    """Raised when final validation detects an inconsistent recommendation.
+
+    Only produced by explicit callers of ``_final_validate`` (e.g. tests); the
+    normal ``recommend_from_intent`` path degrades gracefully instead.
+    """
+
+
 def _final_validate(
     recommendations: list[dict[str, Any]],
     profile: StudentProfile,
@@ -35,23 +43,52 @@ def _final_validate(
     context: Any | None = None,
 ) -> None:
     """Re-evaluate academic and hard-property checks before rendering."""
+    failures = _final_validation_failures(recommendations, profile, intent, snapshot, context)
+    if failures:
+        raise FinalValidationError(failures[0]["reason"])
+
+
+def _final_validation_failures(
+    recommendations: list[dict[str, Any]],
+    profile: StudentProfile,
+    intent: QueryIntent,
+    snapshot: DatasetSnapshot,
+    context: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Return one failure record per recommendation that no longer validates."""
     offerings = {offering.offering_id: offering for offering in snapshot.offerings}
     context = context or resolve_policy_context(profile, snapshot)
     excluded_courses = _excluded_course_ids(profile, context, snapshot)
+    failures: list[dict[str, Any]] = []
     for item in recommendations:
         offering = offerings.get(item["offering_id"])
+        reason = None
         if offering is None or offering.course_id != item["course_id"]:
-            raise RuntimeError("Final validation rejected a mismatched offering reference.")
-        if offering.campus.casefold() != profile.campus.casefold() or offering.semester_id != profile.target_semester_id:
-            raise RuntimeError("Final validation rejected an offering outside the requested campus or semester.")
-        if canonical_course_id(snapshot, offering.course_id) in excluded_courses:
-            raise RuntimeError("Final validation rejected a completed or in-progress course.")
-        eligibility = evaluate_eligibility(profile, offering, intent.requested_category, context, snapshot)
-        if eligibility.overall_status != DecisionStatus.PASS:
-            raise RuntimeError("Final validation rejected a non-eligible recommendation.")
-        for constraint in intent.hard_constraints:
-            if _constraint_status(offering.handout_facts.get(constraint.field), constraint.value) != DecisionStatus.PASS:
-                raise RuntimeError("Final validation rejected an unmet or unsupported hard constraint.")
+            reason = "Final validation rejected a mismatched offering reference."
+        elif offering.campus.casefold() != profile.campus.casefold() or offering.semester_id != profile.target_semester_id:
+            reason = "Final validation rejected an offering outside the requested campus or semester."
+        elif canonical_course_id(snapshot, offering.course_id) in excluded_courses:
+            reason = "Final validation rejected a completed or in-progress course."
+        else:
+            try:
+                eligibility = evaluate_eligibility(profile, offering, intent.requested_category, context, snapshot)
+            except (StopIteration, RuntimeError):
+                
+                eligibility = None
+            if eligibility is None or eligibility.overall_status != DecisionStatus.PASS:
+                reason = "Final validation rejected a non-eligible recommendation."
+            else:
+                for constraint in intent.hard_constraints:
+                    if _constraint_status(offering.handout_facts.get(constraint.field), constraint.value) != DecisionStatus.PASS:
+                        reason = "Final validation rejected an unmet or unsupported hard constraint."
+                        break
+        if reason is not None:
+            failures.append({
+                "offering_id": item.get("offering_id"),
+                "course_code": item.get("course_code"),
+                "reason": reason,
+            })
+    return failures
 
 
 def _excluded_course_ids(profile: StudentProfile, context: Any, snapshot: DatasetSnapshot) -> set[str]:
@@ -150,7 +187,9 @@ def recommend_from_intent(profile: StudentProfile, intent: QueryIntent, snapshot
         requirement = next((
             item for item in requirements
             if item.category == intent.requested_category
-            and canonical_course_id(snapshot, offering.course_id) in {canonical_course_id(snapshot, cid) for cid in next(req.course_pool for req in context.requirements if req.requirement_id == item.requirement_id)}
+            and canonical_course_id(snapshot, offering.course_id) in {canonical_course_id(snapshot, cid) for cid in (
+                next((req.course_pool for req in context.requirements if req.requirement_id == item.requirement_id), ())
+            )}
             and ((item.remaining_amount is not None and item.remaining_amount > 0)
                  or offering.course_id in item.outstanding_mandatory_courses)
         ), None)
@@ -190,8 +229,19 @@ def recommend_from_intent(profile: StudentProfile, intent: QueryIntent, snapshot
         }
         ranked.append((-score, course.code, offering.offering_id, card))
     base["recommendations"] = [item[3] for item in sorted(ranked, key=lambda item: item[:3])]
-    _final_validate(base["recommendations"], profile, intent, snapshot, context)
-    base["final_validation_status"] = "pass"
+    validation_failures = _final_validation_failures(base["recommendations"], profile, intent, snapshot, context)
+    failed_offering_ids = {failure["offering_id"] for failure in validation_failures}
+    if failed_offering_ids:
+        
+        
+        base["recommendations"] = [item for item in base["recommendations"] if item["offering_id"] not in failed_offering_ids]
+        for failure in validation_failures:
+            warning = f"Final validation removed {failure['course_code'] or failure['offering_id']}: {failure['reason']}"
+            if warning not in base["warnings"]:
+                base["warnings"].append(warning)
+        base["final_validation_status"] = "pass_with_removals"
+    else:
+        base["final_validation_status"] = "pass"
     if not base["recommendations"]:
         if not candidates:
             base["no_result_reason"] = "No offerings were supplied for this campus and target semester."

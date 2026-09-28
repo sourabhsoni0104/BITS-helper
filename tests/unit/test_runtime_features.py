@@ -95,7 +95,11 @@ class AccountRepositoryTests(unittest.TestCase):
             other_user, other_profile = repo.register("second@example.edu", "another pass")
             token, session = repo.login("FIRST@example.edu", "long password")
             self.assertEqual((session["user_id"], session["profile_id"], session["role"]), (user_id, profile_id, "admin"))
-            self.assertEqual(repo.get_session(token)["csrf_token"], session["csrf_token"])
+            
+            self.assertNotIn("csrf_token", repo.get_session(token))
+            with repo.lock:
+                row = repo.connection.execute("SELECT * FROM account_sessions").fetchone()
+            self.assertNotIn("csrf_token", row.keys())
             self.assertTrue(repo.verify_csrf(token, session["csrf_token"]))
             self.assertFalse(repo.verify_csrf(token, "wrong"))
             self.assertTrue(repo.owns_profile(user_id, profile_id))
@@ -119,6 +123,38 @@ class AccountRepositoryTests(unittest.TestCase):
             repo.connection.execute("UPDATE account_sessions SET expires_at=?", (time.time() - 1,))
             repo.connection.commit()
             self.assertIsNone(repo.get_session(token))
+            repo.close()
+
+    def test_expired_sessions_are_swept_periodically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = AccountRepository(Path(directory) / "accounts.sqlite")
+            repo.register("sweep@example.edu", "password123")
+            token, _ = repo.login("sweep@example.edu", "password123")
+            repo.connection.execute("UPDATE account_sessions SET expires_at=?", (time.time() - 10,))
+            repo.connection.commit()
+            
+            repo._last_sweep = 0.0
+            self.assertIsNone(repo.get_session(token))
+            with repo.lock:
+                remaining = repo.connection.execute("SELECT COUNT(*) FROM account_sessions").fetchone()[0]
+            self.assertEqual(remaining, 0)
+            repo.close()
+
+    def test_login_rate_limiting_locks_after_repeated_failures(self) -> None:
+        from recommender.storage.accounts import AccountLockedError, MAX_FAILED_LOGINS
+        with tempfile.TemporaryDirectory() as directory:
+            repo = AccountRepository(Path(directory) / "accounts.sqlite")
+            repo.register("target@example.edu", "correct password")
+            for _ in range(MAX_FAILED_LOGINS):
+                with self.assertRaises(AccountError):
+                    repo.login("target@example.edu", "wrong password")
+            with self.assertRaises(AccountLockedError):
+                repo.login("target@example.edu", "correct password")
+            
+            repo.connection.execute("UPDATE login_attempts SET locked_until=0")
+            repo.connection.commit()
+            token, _ = repo.login("target@example.edu", "correct password")
+            self.assertTrue(repo.get_session(token))
             repo.close()
 
     def test_recommendation_history_persists_and_can_be_cleared(self) -> None:

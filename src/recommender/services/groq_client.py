@@ -74,11 +74,26 @@ class GroqClient:
                 body = exc.read().decode("utf-8", errors="replace")[:1000]
                 if exc.code == 429 and attempt < 2:
                     retry_match = re.search(r"try again in ([0-9.]+)s", body, re.IGNORECASE)
-                    suggested = retry_match.group(1) if retry_match else exc.headers.get("retry-after", "1")
-                    delay = min(float(suggested or 1) + 0.25, 15.0)
+                    if retry_match:
+                        suggested: str | float = retry_match.group(1)
+                    else:
+                        header_value = exc.headers.get("retry-after") if exc.headers else None
+                        
+                        
+                        try:
+                            suggested = float(header_value) if header_value is not None else 1.0
+                        except (TypeError, ValueError):
+                            suggested = 1.0
+                    try:
+                        delay = min(float(suggested) + 0.25, 15.0)
+                    except (TypeError, ValueError):
+                        delay = 1.25
                     time.sleep(max(delay, 0.1))
                     continue
                 if exc.code == 400 and "tool_use_failed" in body and attempt < 2:
+                    
+                    
+                    time.sleep(0.25 * (attempt + 1))
                     continue
                 raise GroqAPIError(f"Groq API request failed with HTTP {exc.code}: {body}") from exc
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:

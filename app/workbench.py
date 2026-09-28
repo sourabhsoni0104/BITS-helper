@@ -31,7 +31,7 @@ from recommender.services.marksheet_import import (
     preview_marksheet,
 )
 from recommender.services.staged_discovery_agent import StagedDiscoveryAgent
-from recommender.storage.accounts import AccountError, AccountExistsError, AccountRepository
+from recommender.storage.accounts import AccountError, AccountExistsError, AccountLockedError, AccountRepository
 from recommender.storage.profiles import (
     ProfileConflictError,
     ProfileRepository,
@@ -43,6 +43,9 @@ MAX_FORM_BYTES = 64 * 1024
 MAX_MULTIPART_BYTES = 10 * 1024 * 1024 + 64 * 1024
 PREVIEW_TTL_SECONDS = 20 * 60
 GUEST_SESSION_SECONDS = 2 * 60 * 60
+
+
+COOKIE_SECURE_FLAG = "; Secure" if os.getenv("APP_COOKIE_SECURE", "false").casefold() == "true" else ""
 STATUSES = tuple(status.value for status in AttemptStatus)
 CAMPUS_OPTIONS = (
     ("Pilani", "Pilani campus"),
@@ -131,6 +134,27 @@ def _esc(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def _session_csrf(session: dict | None, cookie_header: str = "") -> str:
+    """Return the CSRF token to embed in forms.
+
+    Account sessions no longer carry a plaintext token back from storage (only its hash is
+    kept). The login response mirrors the token into a non-HttpOnly ``workbench_csrf``
+    cookie; we read it straight off the request's Cookie header for form rendering.
+    Guests keep their in-memory token.
+    """
+    if not session:
+        return ""
+    token = session.get("csrf_token")
+    if isinstance(token, str) and token:
+        return token
+    try:
+        cookie = SimpleCookie(cookie_header)
+        morsel = cookie.get("workbench_csrf")
+        return morsel.value if morsel is not None else ""
+    except Exception:
+        return ""
+
+
 def _page(title: str, body: str, session: dict | None = None) -> bytes:
     if session:
         links = '<a href="/">Profile</a><a href="/recommend">Recommendations</a><a href="/history">History</a><a href="/import">Upload transcript</a><a href="/documents">Chat</a>'
@@ -138,7 +162,7 @@ def _page(title: str, body: str, session: dict | None = None) -> bytes:
             links += '<a href="/login">Switch to saved account</a>'
         signout_label = "Forget this session" if session.get("is_guest") else "Sign out"
         nav = f"""<nav><a href="/" style="font-size:1.15rem">BITSbuddy</a>{links}
-        <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><button class="secondary">{signout_label}</button></form></nav>"""
+        <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{_esc(_session_csrf(session))}"><button class="secondary">{signout_label}</button></form></nav>"""
     else:
         nav = '<nav><a href="/" style="font-size:1.15rem">BITSbuddy</a></nav>'
     text = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_esc(title)}</title><style>{CSS}</style></head><body><main class="shell">{nav}{body}</main></body></html>'
@@ -548,7 +572,11 @@ def make_workbench_handler(
             self.send_header("Referrer-Policy", "same-origin")
             self.send_header("Cache-Control", "no-store")
             for key, value in (extra or {}).items():
-                self.send_header(key, value)
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        self.send_header(key, item)
+                else:
+                    self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -614,10 +642,20 @@ def make_workbench_handler(
                 self._render("Sign in", self._login_form(), None, 401)
             return session
 
+        def _csrf_token_for_session(self, session: dict) -> str:
+            """CSRF token to embed in forms for this request's session.
+
+            Guests keep their in-memory token; account sessions only store a hash, so the
+            login response mirrors the plaintext token into a non-HttpOnly cookie that we
+            read back off the request.
+            """
+            token = _session_csrf(session, self.headers.get("Cookie", ""))
+            return token if isinstance(token, str) else ""
+
         def _check_csrf(self, session: dict, data: dict[str, list[str]]) -> bool:
             supplied = self.headers.get("X-CSRF-Token") or self._value(data, "csrf_token")
             if session.get("is_guest"):
-                return isinstance(supplied, str) and hmac.compare_digest(session["csrf_token"], supplied)
+                return isinstance(supplied, str) and hmac.compare_digest(self._csrf_token_for_session(session), supplied)
             return accounts.verify_csrf(self._cookie_token(), supplied)
 
         @staticmethod
@@ -695,7 +733,19 @@ def make_workbench_handler(
                                 previews.pop(token_hash(token), None)
                             with chat_lock:
                                 chat_threads.pop(token_hash(token), None)
-                    self._send(_page("Signed out", '<p class="ok">You are signed out.</p><p><a href="/login">Sign in</a></p>'), extra={"Set-Cookie": "workbench_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"})
+                    self._send(_page("Signed out", '<p class="ok">You are signed out.</p><p><a href="/login">Sign in</a></p>'), extra={
+                        "Set-Cookie": [
+                            (
+                                "workbench_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+                                + ("; Secure" if COOKIE_SECURE_FLAG else "")
+                            ),
+                            
+                            (
+                                "workbench_csrf=; Path=/; Max-Age=0; SameSite=Lax"
+                                + ("; Secure" if COOKIE_SECURE_FLAG else "")
+                            ),
+                        ],
+                    })
                 elif path == "/":
                     self._save_profile(session, data)
                 elif path == "/recommend":
@@ -743,7 +793,11 @@ def make_workbench_handler(
                 email_value, password = self._value(data, "email"), self._value(data, "password")
                 if path == "/register":
                     accounts.register(email_value, password)
-                token, _ = accounts.login(email_value, password)
+                token, login_session = accounts.login(email_value, password)
+            except AccountLockedError as exc:
+                current = self._session()
+                self._send(_page("Sign in", self._login_form(str(exc), bool(current and current.get("is_guest")))), 429, extra={"Retry-After": str(int(exc.retry_after))})
+                return
             except (AccountExistsError, AccountError, ValueError, TypeError, UnicodeError, OverflowError) as exc:
                 current = self._session()
                 self._render("Sign in", self._login_form(str(exc), bool(current and current.get("is_guest"))), current, 400)
@@ -751,7 +805,9 @@ def make_workbench_handler(
             discard_guest(self._cookie_token())
             self.send_response(303)
             self.send_header("Location", "/")
-            self.send_header("Set-Cookie", f"workbench_session={token}; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax")
+            self.send_header("Set-Cookie", f"workbench_session={token}; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax{COOKIE_SECURE_FLAG}")
+            
+            self.send_header("Set-Cookie", f"workbench_csrf={login_session['csrf_token']}; Path=/; SameSite=Lax{COOKIE_SECURE_FLAG}")
             self.send_header("Content-Length", "0")
             self.end_headers()
 
@@ -782,7 +838,7 @@ def make_workbench_handler(
                 transcript_note = f'<p class="ok">Loaded {_esc(review.get("filename"))}: {len(transcript_attempts)} course records are filled below{saved_text}{f"; {skipped} uncertain row(s) need manual attention" if skipped else ""}. {_esc(identity)}{f" · Detected: { _esc(detected_profile) }" if detected_profile else ""}</p>'
             else:
                 transcript_note = '<p class="muted">Upload your latest performance sheet and the complete recognized course history will be filled into this profile automatically.</p>'
-            transcript_upload = f'''<section class="panel"><h2>Upload latest transcript</h2>{transcript_note}<form method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="preview"><input type="file" name="file" accept="application/pdf,.pdf" required><button>{'Replace transcript' if review or profile else 'Upload and fill my course history'}</button></form></section>'''
+            transcript_upload = f'''<section class="panel"><h2>Upload latest transcript</h2>{transcript_note}<form method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="action" value="preview"><input type="file" name="file" accept="application/pdf,.pdf" required><button>{'Replace transcript' if review or profile else 'Upload and fill my course history'}</button></form></section>'''
             version = profile.profile_version if profile else 0
             catalog = course_catalog()
             admission_number = int(admission_value) if str(admission_value).isdigit() else None
@@ -791,7 +847,7 @@ def make_workbench_handler(
             saved_target = profile.target_semester_id if profile else ""
             target_value = saved_target if saved_target in planning_ids else planning_terms[0][0]
             details = f'''<section class="panel"><form method="post" action="/">
-            <input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="profile_version" value="{version}">
+            <input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="profile_version" value="{version}">
             {_select('Campus','campus',CAMPUS_OPTIONS,campus_value,required=True,blank=None)}
             {_field('Year you joined BITS','admission_year',admission_value,kind='number',required=True)}
             {_select('Degree / programme','primary_programme',PROGRAMME_OPTIONS,primary,required=True)}
@@ -818,7 +874,7 @@ def make_workbench_handler(
             should_record = query.get("record", [""])[0] == "1"
             saved_notice = '<p class="ok">Profile saved.</p>' if saved else ""
             body = f'''<h1>Course preferences</h1><p class="lede">Step 2 of 2 · Tell us what you want from your next courses.</p>{saved_notice}
-            <form class="panel" method="post" action="/recommend"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}">
+            <form class="panel" method="post" action="/recommend"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}">
             {_textarea('What kind of courses are you looking for?','q',q,4)}
             <button>Get recommendations</button></form>'''
             snapshot = active_snapshot()
@@ -918,10 +974,10 @@ def make_workbench_handler(
                     reason = f'<br><span class="muted">{_esc(item.get("reason"))}</span>' if item.get("reason") else ""
                     courses.append(f'<li><strong>{_esc(item.get("course_code"))} — {_esc(item.get("title"))}</strong>{reason}</li>')
                 result = f'<ul>{"".join(courses)}</ul>' if courses else f'<p class="muted">{_esc(entry.get("no_result_reason") or "No recommendations were found.")}</p>'
-                rerun = f'''<form method="post" action="/recommend"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="q" value="{_esc(entry.get('query'))}"><button class="secondary">Run again</button></form>'''
+                rerun = f'''<form method="post" action="/recommend"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="q" value="{_esc(entry.get('query'))}"><button class="secondary">Run again</button></form>'''
                 cards.append(f'<article class="panel"><p class="muted">{_esc(timestamp)}</p><h2>{_esc(entry.get("query"))}</h2>{result}{rerun}</article>')
             if cards:
-                clear = f'''<form method="post" action="/history"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear history</button></form>'''
+                clear = f'''<form method="post" action="/history"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear history</button></form>'''
                 body = "".join(cards) + clear
             else:
                 body = '<div class="empty">Your past recommendations will appear here.</div>'
@@ -1002,7 +1058,7 @@ def make_workbench_handler(
             else:
                 ready = ""
             body = f'''<h1>Upload latest transcript</h1><p class="lede">Upload your latest BITS performance sheet. The PDF is discarded immediately after parsing; recognized past and current courses are filled into your profile.</p>{ready}
-            <form class="panel" method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="preview"><label>Latest transcript (PDF)</label><input type="file" name="file" accept="application/pdf,.pdf" required><button>Upload and fill my profile</button></form>'''
+            <form class="panel" method="post" action="/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="action" value="preview"><label>Latest transcript (PDF)</label><input type="file" name="file" accept="application/pdf,.pdf" required><button>Upload and fill my profile</button></form>'''
             self._render("Upload transcript", body, session)
 
         @staticmethod
@@ -1022,7 +1078,7 @@ def make_workbench_handler(
             if not rows:
                 table = '<div class="empty">No course attempts were recognized. You can enter history manually on your profile.</div>'
             else:
-                table = f'''<form method="post" action="/import" class="panel"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="action" value="confirm">
+                table = f'''<form method="post" action="/import" class="panel"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="action" value="confirm">
                 <p class="muted">Extracted grades do not determine pass or fail. Choose a status for every selected row and check the grade, units, and term.</p>
                 <table><thead><tr><th>Add</th><th>Course</th><th>Title</th><th>Grade</th><th>Units</th><th>Academic term</th><th>Result</th></tr></thead><tbody>{''.join(rows)}</tbody></table><button>Add selected courses to my history</button></form>'''
             issues = "".join(f'<li>{_esc(item.get("message"))}</li>' for item in review.get("issues", []))
@@ -1092,7 +1148,7 @@ def make_workbench_handler(
             try:
                 data, payload, filename = self._multipart()
                 supplied = data.get("csrf_token")
-                valid_csrf = (isinstance(supplied, str) and hmac.compare_digest(session["csrf_token"], supplied)) if session.get("is_guest") else accounts.verify_csrf(self._cookie_token(), supplied)
+                valid_csrf = (isinstance(supplied, str) and hmac.compare_digest(self._csrf_token_for_session(session), supplied)) if session.get("is_guest") else accounts.verify_csrf(self._cookie_token(), supplied)
                 if not valid_csrf:
                     self._render("Request expired", '<p class="error">Your form token is invalid or expired.</p>', session, 403)
                     return
@@ -1194,9 +1250,9 @@ def make_workbench_handler(
                 conversation.append(f'<p><strong>You</strong><br>{_esc(item.get("question"))}</p><article class="card"><strong>BITSbuddy</strong><p>{answer_html}</p>{source_html}</article>')
             error_html = f'<p class="error">{_esc(error)}</p>' if error else ""
             empty = '<div class="empty">Ask about courses, regulations, handouts, timetables, or anything else.</div>' if not history else ""
-            form = f'''<form method="post" action="/documents" class="panel"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}">
+            form = f'''<form method="post" action="/documents" class="panel"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}">
             {_textarea('Ask anything','q','',3)}<button>Send</button></form>'''
-            clear = f'''<form method="post" action="/documents"><input type="hidden" name="csrf_token" value="{_esc(session['csrf_token'])}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear chat</button></form>''' if history else ""
+            clear = f'''<form method="post" action="/documents"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear chat</button></form>''' if history else ""
             self._render("Ask BITSbuddy", f'<h1>Ask BITSbuddy</h1>{form}{error_html}{empty}{"".join(conversation)}{clear}', session)
 
         def _source_page(self, session: dict, document_id: str, query: dict[str, list[str]]) -> None:
@@ -1239,7 +1295,7 @@ def make_workbench_handler(
                     source.relative_to(source_root)
                     if source.is_file() and source.suffix.casefold() in {".pdf", ".docx"}:
                         payload = source.read_bytes()
-                        safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", source.name)
+                        safe_name = re.sub(r"[._ -]{2,}", ".", re.sub(r"^[-. ]+|[-. ]+$", "", re.sub(r"[^A-Za-z0-9._ -]", "_", source.name))) or "download"
                         self._send(payload, 200, "application/pdf" if source.suffix.casefold() == ".pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document", {"Content-Disposition": f'inline; filename="{safe_name}"'})
                         return
                 except (OSError, ValueError):

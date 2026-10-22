@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: askbits
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /login
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: APP_COOKIE_SECURE
+        value: "true"

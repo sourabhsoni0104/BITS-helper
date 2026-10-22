@@ -83,6 +83,71 @@ class WorkbenchHTTPTests(unittest.TestCase):
         match = re.search(r'name="csrf_token" value="([^"]+)"', page)
         return html.unescape(match.group(1)) if match else None
 
+    def test_rendered_logout_form_ends_account_session_on_each_page(self):
+        for index, path in enumerate(("/", "/documents", "/history", "/import", "/login")):
+            with self.subTest(path=path):
+                client = self.client()
+                self.register(client, f"logout-{index}@example.edu")
+                page = client.open(self.base + path).read().decode()
+                logout_form = re.search(r'<form method="post" action="/logout">(.*?)</form>', page, re.S)
+                self.assertIsNotNone(logout_form)
+                csrf = self.csrf(logout_form.group(1))
+                self.assertTrue(csrf)
+                cookie_jar = next(handler.cookiejar for handler in client.handlers
+                                  if isinstance(handler, HTTPCookieProcessor))
+                token = next(cookie.value for cookie in cookie_jar if cookie.name == "workbench_session")
+                response = client.open(Request(self.base + "/logout", data=urlencode({
+                    "csrf_token": csrf,
+                }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"}))
+                self.assertIn("You are signed out.", response.read().decode())
+                self.assertFalse(any(cookie.name in {"workbench_session", "workbench_csrf"}
+                                     for cookie in cookie_jar))
+                with closing(AccountRepository(self.root / "accounts.sqlite")) as accounts:
+                    self.assertIsNone(accounts.get_session(token))
+                after = client.open(self.base + "/").read().decode()
+                self.assertIn("Sign in", after)
+                self.assertNotIn('action="/logout"', after)
+
+    def test_logout_rejects_missing_wrong_and_other_account_tokens(self):
+        first, second = self.client(), self.client()
+        self.register(first, "logout-first@example.edu")
+        other_page = self.register(second, "logout-second@example.edu")
+        for csrf in ("", "wrong", self.csrf(other_page)):
+            with self.subTest(csrf=csrf):
+                with self.assertRaises(HTTPError) as caught:
+                    first.open(Request(self.base + "/logout", data=urlencode({
+                        "csrf_token": csrf,
+                    }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"}))
+                self.assertEqual(caught.exception.code, 403)
+                caught.exception.close()
+                page = first.open(self.base + "/").read().decode()
+                self.assertIn('action="/logout"', page)
+
+    def test_missing_chat_corpus_is_logged_and_keeps_question(self):
+        self.handler.close_resources()
+        with patch("app.workbench.GroqClient.from_environment", return_value=object()):
+            self.handler = make_workbench_handler(
+                snapshot_path=self.root / "snapshot.json",
+                corpus_path=self.root / "missing-corpus.sqlite",
+                profile_db=self.root / "profiles.sqlite",
+                account_db=self.root / "accounts.sqlite",
+                review_path=self.root / "review.json", index_path=self.root / "index.html",
+            )
+        self.server.RequestHandlerClass = self.handler
+        guest = self.client()
+        page = guest.open(Request(self.base + "/guest", data=b"", method="POST")).read().decode()
+        question = 'What are the prerequisites for CS F999? <test>'
+        with self.assertLogs("app.workbench", level="ERROR") as logs:
+            page = guest.open(Request(self.base + "/documents", data=urlencode({
+                "csrf_token": self.csrf(page), "q": question,
+            }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})).read().decode()
+        self.assertIn("The reference library is not ready yet.", page)
+        textarea = re.search(r'<textarea[^>]+name="q"[^>]*>(.*?)</textarea>', page, re.S)
+        self.assertIsNotNone(textarea)
+        self.assertEqual(html.unescape(textarea.group(1)), question)
+        self.assertIn("Corpus database not found:", "\n".join(logs.output))
+        self.assertNotIn("missing-corpus.sqlite", page)
+
     def test_auth_required_profile_csrf_and_owner_scoping(self):
         anonymous = self.client()
         page = anonymous.open(self.base + "/").read().decode()

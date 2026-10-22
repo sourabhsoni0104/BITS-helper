@@ -8,6 +8,7 @@ import html
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -43,6 +44,7 @@ MAX_FORM_BYTES = 64 * 1024
 MAX_MULTIPART_BYTES = 10 * 1024 * 1024 + 64 * 1024
 PREVIEW_TTL_SECONDS = 20 * 60
 GUEST_SESSION_SECONDS = 2 * 60 * 60
+LOGGER = logging.getLogger(__name__)
 
 
 COOKIE_SECURE_FLAG = "; Secure" if os.getenv("APP_COOKIE_SECURE", "false").casefold() == "true" else ""
@@ -155,17 +157,33 @@ def _session_csrf(session: dict | None, cookie_header: str = "") -> str:
         return ""
 
 
-def _page(title: str, body: str, session: dict | None = None) -> bytes:
+FORM_SCRIPT = """
+<script>
+document.addEventListener('keydown', function (event) {
+    if (event.defaultPrevented || event.key !== 'Enter' || event.shiftKey ||
+        event.ctrlKey || event.metaKey || event.altKey || event.isComposing ||
+        event.keyCode === 229) return;
+    const field = event.target;
+    if (!(field instanceof HTMLTextAreaElement) ||
+        !field.hasAttribute('data-submit-on-enter') || !field.form) return;
+    event.preventDefault();
+    if (!event.repeat) field.form.requestSubmit();
+});
+</script>
+"""
+
+
+def _page(title: str, body: str, session: dict | None = None, *, csrf_token: str = "") -> bytes:
     if session:
         links = '<a href="/">Profile</a><a href="/recommend">Recommendations</a><a href="/history">History</a><a href="/import">Upload transcript</a><a href="/documents">Chat</a>'
         if session.get("is_guest"):
             links += '<a href="/login">Switch to saved account</a>'
         signout_label = "Forget this session" if session.get("is_guest") else "Sign out"
         nav = f"""<nav><a href="/" style="font-size:1.15rem">BITSbuddy</a>{links}
-        <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{_esc(_session_csrf(session))}"><button class="secondary">{signout_label}</button></form></nav>"""
+        <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{_esc(csrf_token or _session_csrf(session))}"><button class="secondary">{signout_label}</button></form></nav>"""
     else:
         nav = '<nav><a href="/" style="font-size:1.15rem">BITSbuddy</a></nav>'
-    text = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_esc(title)}</title><style>{CSS}</style></head><body><main class="shell">{nav}{body}</main></body></html>'
+    text = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_esc(title)}</title><style>{CSS}</style></head><body><main class="shell">{nav}{body}</main>{FORM_SCRIPT}</body></html>'
     return text.encode("utf-8")
 
 
@@ -252,7 +270,7 @@ def _transcript_profile_hints(student_id: str | None) -> dict[str, object]:
 
 
 def _textarea(label: str, name: str, value: object = "", rows: int = 6) -> str:
-    return f'<label for="{_esc(name)}">{_esc(label)}</label><textarea id="{_esc(name)}" name="{_esc(name)}" rows="{rows}">{_esc(value)}</textarea>'
+    return f'<label for="{_esc(name)}">{_esc(label)}</label><textarea id="{_esc(name)}" name="{_esc(name)}" rows="{rows}" data-submit-on-enter aria-describedby="{_esc(name)}-hint">{_esc(value)}</textarea><small class="muted" id="{_esc(name)}-hint">Enter to submit. Shift+Enter for a new line.</small>'
 
 
 def _status_select(name: str, selected: str | None) -> str:
@@ -581,7 +599,8 @@ def make_workbench_handler(
             self.wfile.write(body)
 
         def _render(self, title: str, body: str, session: dict | None = None, status: int = 200) -> None:
-            self._send(_page(title, body, session), status)
+            csrf_token = self._csrf_token_for_session(session) if session else ""
+            self._send(_page(title, body, session, csrf_token=csrf_token), status)
 
         def _cookie_token(self) -> str | None:
             try:
@@ -1223,7 +1242,11 @@ def make_workbench_handler(
                     history = [*history, response][-10:]
                     with chat_lock:
                         chat_threads[key] = history
+                except CorpusError:
+                    LOGGER.exception("Chat reference library is unavailable")
+                    error = "The reference library is not ready yet. Please try again later."
                 except Exception:
+                    LOGGER.exception("Chat request failed")
                     error = "I couldn't answer that right now. Please try again."
             conversation = []
             for item in history:
@@ -1251,7 +1274,7 @@ def make_workbench_handler(
             error_html = f'<p class="error">{_esc(error)}</p>' if error else ""
             empty = '<div class="empty">Ask about courses, regulations, handouts, timetables, or anything else.</div>' if not history else ""
             form = f'''<form method="post" action="/documents" class="panel"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}">
-            {_textarea('Ask anything','q','',3)}<button>Send</button></form>'''
+            {_textarea('Ask anything','q',q if error else '',3)}<button>Send</button></form>'''
             clear = f'''<form method="post" action="/documents"><input type="hidden" name="csrf_token" value="{_esc(self._csrf_token_for_session(session))}"><input type="hidden" name="clear" value="1"><button class="secondary">Clear chat</button></form>''' if history else ""
             self._render("Ask BITSbuddy", f'<h1>Ask BITSbuddy</h1>{form}{error_html}{empty}{"".join(conversation)}{clear}', session)
 

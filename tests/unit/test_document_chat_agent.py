@@ -51,9 +51,10 @@ class DocumentChatAgentTests(unittest.TestCase):
                 CREATE TABLE sources(source_path TEXT PRIMARY KEY,file_name TEXT,document_id TEXT);
                 CREATE TABLE pages(document_id TEXT,page_number INTEGER,unit_key TEXT,text TEXT,verification_status TEXT,section TEXT);
                 CREATE VIRTUAL TABLE pages_fts USING fts5(document_id UNINDEXED,page_number UNINDEXED,file_name UNINDEXED,document_type UNINDEXED,semester UNINDEXED,section UNINDEXED,unit_key UNINDEXED,text,tokenize='unicode61');
-                INSERT INTO documents VALUES('DOC-1','hash','regulations.pdf','regulations',NULL,1,'v1','now');
+                INSERT INTO documents VALUES('DOC-1','hash','CS_F999_handout.pdf','handout',NULL,2,'v1','now');
+                INSERT INTO pages VALUES('DOC-1',1,'1','Course No: CS F999\nCourse Title: Example Course','needs_review',NULL);
                 INSERT INTO pages VALUES('DOC-1',4,'4','A student must complete the documented prerequisite before registering for CS F999.','needs_review','Prerequisites');
-                INSERT INTO pages_fts VALUES('DOC-1',4,'regulations.pdf','regulations',NULL,'Prerequisites','4','A student must complete the documented prerequisite before registering for CS F999.');
+                INSERT INTO pages_fts VALUES('DOC-1',4,'CS_F999_handout.pdf','handout',NULL,'Prerequisites','4','A student must complete the documented prerequisite before registering for CS F999.');
             """)
         return path
 

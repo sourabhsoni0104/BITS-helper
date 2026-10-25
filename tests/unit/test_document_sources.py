@@ -144,6 +144,23 @@ class DocumentSourceTests(unittest.TestCase):
         self.assertEqual(source_policy("From the handout, what is the course code of CS F222?")["depth"], "lookup")
         self.assertEqual(source_policy("Who teaches CS F222?")["depth"], "lookup")
 
+    def test_course_identity_survives_several_changes_in_question_depth(self):
+        client = chat_tests.FakeClient("A sourced answer. [1]", "documents", [1])
+        agent = DocumentChatAgent(client, self.corpus)
+        history = []
+        for question, source_type in (
+            ("What is the course number of Discrete Structures for Computer Science?", "bulletin"),
+            ("More details about the graph topics taught, please.", "handout"),
+            ("Just its course number, please.", "bulletin"),
+        ):
+            result = agent.answer(question, history)
+            history.append(result)
+            self.assertEqual(result["course_context"]["code"], "CS F222")
+            payload = json.loads(client.messages[-1][1]["content"])
+            self.assertEqual({source["document_type"] for source in payload["repository_sources"]}, {source_type})
+        result = agent.answer("More details about MATH F213, please.", history)
+        self.assertEqual(result["course_context"]["code"], "MATH F213")
+
 
 if __name__ == "__main__":
     unittest.main()

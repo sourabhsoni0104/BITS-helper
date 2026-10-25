@@ -57,6 +57,12 @@ class DocumentChatAgent:
     def answer(self, question: str, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         history = history or []
         previous_question = str(history[-1].get("question") or "") if history else ""
+        course_context = history[-1].get("course_context") if history else None
+        if isinstance(course_context, dict):
+            previous_question = " ".join(filter(None, (
+                str(course_context.get("code") or ""),
+                str(course_context.get("title") or ""), previous_question,
+            )))
         retrieved = select_document_sources(self.corpus_path, question, previous_question, limit=5)
         handout = retrieved.get("handout_selection")
         citations = retrieved.get("citations", [])
@@ -113,4 +119,5 @@ class DocumentChatAgent:
             "answer": answer,
             "mode": mode,
             "citations": used_citations,
+            "course_context": retrieved.get("course"),
         }

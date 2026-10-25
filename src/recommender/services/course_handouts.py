@@ -35,6 +35,7 @@ def _matches(left: str, right: str) -> bool:
 
 def course_handout_sources(
     database: str | Path, question: str, previous_question: str = "", limit: int = 5,
+    *, resolve_only: bool = False,
 ) -> dict[str, Any] | None:
     """Return scoped sources, or None when ordinary cross-library search applies.
 
@@ -43,9 +44,9 @@ def course_handout_sources(
     """
     general_source = re.search(r"\b(?:bulletin|regulations|timetable)\b", question, re.I)
     rejected_source = re.search(r"\b(?:not|instead of|rather than)\s+(?:the\s+)?(?:bulletin|regulations|timetable)\b", question, re.I)
-    if general_source and not (rejected_source or re.search(r"\bhandout\b", question, re.I)):
+    if not resolve_only and general_source and not (rejected_source or re.search(r"\bhandout\b", question, re.I)):
         return None
-    if not (_DETAIL.search(question) or _CODE.search(question) or (rejected_source and previous_question)):
+    if not resolve_only and not (_DETAIL.search(question) or _CODE.search(question) or (rejected_source and previous_question)):
         return None
     if not Path(database).is_file():
         raise CorpusError(f"Corpus database not found: {database}")
@@ -91,6 +92,8 @@ def course_handout_sources(
         close = [item[1] for item in candidates if best_score - item[0] < 0.15]
         if len(close) > 1:
             return {"status": "ambiguous", "courses": close, "citations": []}
+        if resolve_only:
+            return {"status": "matched", "course": course, "citations": []}
 
         focus = set(_words(question)) - set(_words(course["title"])) - set(_words(course["code"])) - _FILLER
         focus = {word for word in focus if len(word) >= 3}
@@ -115,7 +118,8 @@ def course_handout_sources(
                 "excerpt": page["text"],
             }))
         passages.sort(key=lambda item: (-item[0], item[1]["page"] or 0))
-        relevant = [passage for score, passage in passages if score > 0]
+        broad_details = re.search(r"\b(?:more\s+details?|in\s+detail|comprehensive|full\s+(?:syllabus|details)|detailed\s+overview)\b", question, re.I)
+        relevant = [passage for score, passage in passages if score > 0 or broad_details]
         citations = (relevant or [passage for _, passage in passages[:1]])[:limit]
         for number, citation in enumerate(citations, 1):
             citation["number"] = number
